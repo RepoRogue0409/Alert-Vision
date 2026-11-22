@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ALERT VISION — Multi-Camera Control Operations Desk</title>
+  <style>
+    :root {
+      --bg-dark: #070b19;
+      --panel-bg: #0f1626;
+      --border-glow: #22344c;
+      --accent-neon: #00f2fe;
+      --text-white: #f8fafc;
+      --text-gray: #64748b;
+      --color-safe: #10b981;
+      --color-warn: #eab308;
+      --color-danger: #f97316;
+      --color-critical: #ef4444;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background-color: var(--bg-dark);
+      color: var(--text-white);
+      font-family: 'Segoe UI', -apple-system, sans-serif;
+      display: flex;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    .sidebar {
+      width: 350px;
+      min-width: 350px;
+      background-color: var(--panel-bg);
+      border-right: 1px solid var(--border-glow);
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      overflow-y: auto;
+    }
+
+    .sidebar h2 {
+      font-size: 1.3rem;
+      margin: 0;
+      letter-spacing: 1px;
+      color: var(--accent-neon);
+    }
+
+    .config-group {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .config-group > label {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--text-gray);
+    }
+
+    .config-group select,
+    .config-group input[type="text"],
+    .config-group input[type="number"] {
+      background: #070b19;
+      border: 1px solid var(--border-glow);
+      color: white;
+      padding: 9px;
+      border-radius: 6px;
+      outline: none;
+      width: 100%;
+      font-size: 0.8rem;
+    }
+
+    .slider-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 0.78rem;
+      color: var(--text-gray);
+    }
+
+    .slider-row span { min-width: 96px; }
+
+    .slider-row input[type="range"] {
+      flex: 1;
+      accent-color: var(--accent-neon);
+    }
+
+    .slider-row em {
+      font-style: normal;
+      color: var(--text-white);
+      min-width: 42px;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .channel-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .channel-row {
+      border: 1px solid var(--border-glow);
+      border-radius: 8px;
+      padding: 10px;
+      background: rgba(0, 0, 0, 0.25);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .channel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 0.72rem;
+      letter-spacing: 1px;
+      color: var(--accent-neon);
+    }
+
+    .channel-remove {
+      background: transparent;
+      border: 1px solid var(--border-glow);
+      color: var(--text-gray);
+      border-radius: 4px;
+      cursor: pointer;
+      padding: 1px 7px;
+      font-size: 0.75rem;
+    }
+
+    .channel-remove:hover {
+      color: var(--color-critical);
+      border-color: var(--color-critical);
+    }
+
+    .channel-controls {
+      display: flex;
+      gap: 6px;
+    }
+
+    .channel-controls select { max-width: 110px; }
+
+    .ghost-btn {
+      background: transparent;
+      border: 1px dashed var(--border-glow);
+      color: var(--accent-neon);
+      padding: 9px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.78rem;
+      letter-spacing: 1px;
+    }
+
+    .ghost-btn:hover { border-color: var(--accent-neon); }
+
+    .main-workspace {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      padding: 24px;
+      gap: 20px;
+      overflow-y: auto;
+    }
+
+    .top-nav {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--border-glow);
+      padding-bottom: 12px;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .top-nav h1 {
+      margin: 0;
+      font-size: 1.45rem;
+      font-weight: 800;
+      letter-spacing: 0.5px;
+    }
+
+    .top-nav .focus-label {
+      color: var(--accent-neon);
+      font-size: 0.78rem;
+      letter-spacing: 1px;
+    }
+
+    .link-status {
+      background: rgba(16, 185, 129, 0.1);
+      padding: 6px 16px;
+      border-radius: 20px;
+      color: var(--color-safe);
+      font-size: 0.85rem;
+      font-weight: bold;
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      transition: all 0.3s ease;
+    }
+
+    .link-status.offline {
+      background: rgba(239, 68, 68, 0.1);
+      color: var(--color-critical);
+      border-color: rgba(239, 68, 68, 0.35);
+    }
+
+    .viewport-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 18px;
+    }
+
+    .cam-tile {
+      background: var(--panel-bg);
+      border: 1px solid var(--border-glow);
+      border-radius: 12px;
+      padding: 12px;
+      cursor: pointer;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .cam-tile.focused {
+      border-color: var(--accent-neon);
+      box-shadow: 0 0 0 1px rgba(0, 242, 254, 0.35), 0 0 24px rgba(0, 242, 254, 0.12);
+    }
+
+    .cam-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .cam-title {
+      font-size: 0.78rem;
+      letter-spacing: 1px;
+      color: var(--text-gray);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .cam-badge {
+      font-size: 0.7rem;
+      font-weight: bold;
+      letter-spacing: 1px;
+      padding: 3px 10px;
+      border-radius: 12px;
+      background: rgba(100, 116, 139, 0.15);
+      color: var(--text-gray);
+      border: 1px solid rgba(100, 116, 139, 0.35);
+      white-space: nowrap;
+    }
+
+    .video-box {
+      width: 100%;
+      aspect-ratio: 16/9;
+      background: #000;
+      border-radius: 8px;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .video-box img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+
+    .cam-foot {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.74rem;
+      color: var(--text-gray);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .lower-grid {
+      display: grid;
+      grid-template-columns: 1.4fr 1fr;
+      gap: 20px;
+    }
+
+    @media (max-width: 1100px) {
+      body { flex-direction: column; height: auto; overflow: auto; }
+      .sidebar { width: 100%; min-width: 0; }
+      .lower-grid { grid-template-columns: 1fr; }
+    }
+
+    .metrics-row {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+    }
+
+    .metric-tile {
+      background: var(--panel-bg);
+      border: 1px solid var(--border-glow);
+      padding: 16px;
+      border-radius: 10px;
+      text-align: center;
+    }
+
+    .metric-label {
+      font-size: 0.72rem;
+      letter-spacing: 1px;
+      color: var(--text-gray);
+    }
+
+    .metric-num {
+      font-size: 1.9rem;
+      font-weight: bold;
+      color: var(--accent-neon);
+      margin-top: 4px;
+      transition: color 0.3s ease;
+    }
+
+    .suggestions-card {
+      background: rgba(255, 255, 255, 0.02);
+      border-left: 4px solid var(--accent-neon);
+      padding: 14px;
+      border-radius: 0 8px 8px 0;
+      font-size: 0.9rem;
+      margin-top: 16px;
+      transition: border-color 0.3s ease;
+    }
+
+    .suggestions-card ul {
+      margin: 0;
+      padding-left: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .viewport-card {
+      background: var(--panel-bg);
+      border: 1px solid var(--border-glow);
+      border-radius: 12px;
+      padding: 16px;
+    }
+
+    .viewport-card h3 {
+      margin: 0 0 12px 0;
+      color: var(--text-white);
+      border-bottom: 1px solid var(--border-glow);
+      padding-bottom: 8px;
+      font-size: 0.95rem;
+      letter-spacing: 0.5px;
+    }
+
+    .log-ledger {
+      height: 300px;
+      overflow-y: auto;
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid var(--border-glow);
+      border-radius: 8px;
+      font-family: monospace;
+      font-size: 0.8rem;
+      padding: 12px;
+    }
+
+    .log-row {
+      padding: 6px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+      display: grid;
+      grid-template-columns: 1.2fr 0.8fr 1fr 1.5fr;
+      gap: 6px;
+    }
+
+    .log-row.header {
+      color: var(--text-gray);
+      font-weight: bold;
+      border-bottom: 1px solid var(--border-glow);
+    }
+  </style>
+</head>
+
+<body>
+
+  <!-- Configuration Control Side Deck panel -->
+  <div class="sidebar">
+    <h2>ALERT VISION CONFIG</h2>
+
+    <div class="config-group">
+      <label>Camera Input Channels</label>
+      <div id="channel-list" class="channel-list"></div>
+      <button type="button" id="add-channel" class="ghost-btn">+ ADD CAMERA CHANNEL</button>
+    </div>
+
+    <div class="config-group">
+      <label for="stride-slider">Inference Stride Step</label>
+      <div class="slider-row">
+        <input type="range" id="stride-slider" min="1" max="10" value="1">
+        <em id="stride-val">1</em>
+      </div>
+    </div>
+
+    <div class="config-group">
+      <label>Risk Formula Weights</label>
+      <div class="slider-row">
+        <span>Density</span>
+        <input type="range" id="weight-density" min="0" max="100" value="40">
+        <em id="weight-density-val">0.40</em>
+      </div>
+      <div class="slider-row">
+        <span>Rate of Change</span>
+        <input type="range" id="weight-rate" min="0" max="100" value="20">
+        <em id="weight-rate-val">0.20</em>
+      </div>
+      <div class="slider-row">
+        <span>Convergence</span>
+        <input type="range" id="weight-convergence" min="0" max="100" value="20">
+        <em id="weight-convergence-val">0.20</em>
+      </div>
+      <div class="slider-row">
+        <span>Turbulence</span>
+        <input type="range" id="weight-turbulence" min="0" max="100" value="20">
+        <em id="weight-turbulence-val">0.20</em>
+      </div>
+    </div>
+
+    <div class="config-group">
+      <label for="threshold-slider">Calculated Risk Threshold</label>
+      <div class="slider-row">
+        <input type="range" id="threshold-slider" min="1" max="100" value="55">
+        <em id="threshold-val">0.55</em>
+      </div>
+    </div>
+  </div>
+
+  <!-- Active Analytics Monitoring Space panel -->
+  <div class="main-workspace">
+    <div class="top-nav">
+      <div>
+        <h1>ALERT VISION MULTI-CAMERA NODE</h1>
+        <div id="ui-focus-label" class="focus-label">FOCUS: CAM 1</div>
+      </div>
+      <div id="ui-link-status" class="link-status">● CONTROL DESK SECURE LINK ONLINE</div>
+    </div>
+
+    <div id="viewport-grid" class="viewport-grid"></div>
+
+    <div class="lower-grid">
+      <div>
+        <div class="metrics-row">
+          <div class="metric-tile">
+            <div class="metric-label">HEADCOUNT MAPPING</div>
+            <div class="metric-num" id="ui-headcount">0</div>
+          </div>
+          <div class="metric-tile">
+            <div class="metric-label">DYNAMIC RISK RATING</div>
+            <div class="metric-num" id="ui-risk">SAFE</div>
+          </div>
+          <div class="metric-tile">
+            <div class="metric-label">SURVEILLANCE LATENCY</div>
+            <div class="metric-num" id="ui-latency">12ms</div>
+          </div>
+        </div>
+
+        <div class="suggestions-card" id="ui-advice">
+          <ul>
+            <li>👍 Continue routine monitoring</li>
+            <li>👀 Keep the feed on wider screen</li>
+            <li>📋 Standby — no action required</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="viewport-card">
+        <h3>Live Threat Ledger Console</h3>
+        <div class="log-ledger" id="ui-ledger-box">
+          <div class="log-row header">
+            <div>Timestamp</div>
+            <div>Camera</div>
+            <div>Threat Matrix</div>
+            <div>Action Plan Mapping</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+
+</html>
