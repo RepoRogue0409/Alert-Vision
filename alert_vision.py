@@ -20,9 +20,10 @@ Runtime contract:
     * Detection uses model.track(persist=True) with ByteTrack, so every
       human box receives a persistent integer ID rendered as
       'Person ID: X' on the relayed frame.
-    * Farneback optical flow provides turbulence / convergence / velocity.
-    * A lone detection (people_now <= 1) is hard-clamped to SAFE with
-      turbulence/convergence/velocity suppressed to zero.
+    * CrowdShield analytics (``analytics.py``) score each frame: optical-flow
+      turbulence/divergence feeding an EMA-smoothed risk (density / rate of
+      change / convergence / turbulence weights) plus a physical density
+      cross-check (4 people/m^2 -> HIGH, 6 -> CRITICAL with area calibration).
     * The published risk level uses a time-based debounce with hysteresis
       (escalate hold ~1.5s / de-escalate hold ~4s); alerts fire only on
       confirmed upward transitions and are cooldown-gated per camera.
@@ -57,6 +58,18 @@ import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
+
+from analytics import (
+    CRITICAL_AT,
+    LiveAnalyzer,
+    combine_levels,
+    compute_flow_signal,
+    confidence_live,
+    density_forced_level,
+    density_per_sqm,
+    estimate_ground_area,
+    level_for,
+)
 
 try:
     from websockets.asyncio.server import serve as websocket_server
@@ -109,6 +122,7 @@ MOTION_THRESHOLD = 1.0
 RISK_SCORE_THRESHOLDS = {"moderate": 0.35, "high": 0.55, "critical": 0.75}
 DEFAULT_WEIGHTS = {"density": 0.4, "rate_of_change": 0.2, "convergence": 0.2, "turbulence": 0.2}
 DEFAULT_ALERT_THRESHOLD = 0.55
+DEFAULT_MIN_PEOPLE = 3
 
 # Time-based alert hysteresis (seconds): how long the instant level must hold
 # before it becomes the confirmed level (escalate hold / de-escalate hold).
@@ -187,6 +201,19 @@ def normalize_source(value):
     return text
 
 
+def _optional_float(value):
+    """Parse an optional finite float config value (``None`` when absent/invalid)."""
+    if value is None or value == "":
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(numeric):
+        return None
+    return float(numeric)
+
+
 def _worst_level(levels) -> str:
     worst = "SAFE"
     for level in levels:
@@ -262,7 +289,19 @@ def _sanitize(value):
 class CameraPipeline:
     """One camera channel running in its own daemon worker thread."""
 
-    def __init__(self, cam_id: str, label: str, source, state: "SharedSystemState") -> None:
+    def __init__(
+        self,
+        cam_id: str,
+        label: str,
+        source,
+        state: "SharedSystemState",
+        area_sqm: float = None,
+        height_m: float = None,
+        tilt_deg: float = None,
+        hfov_deg: float = None,
+        vfov_deg: float = None,
+        min_people: float = None,
+    ) -> None:
         self.id = cam_id
         self.label = label
         self.source = source
@@ -302,6 +341,14 @@ class CameraPipeline:
         self.alert_queue: deque = deque(maxlen=ALERT_HISTORY_SIZE)
         self.log_error = False
         self.model_error = None
+
+        self.area_sqm = float(area_sqm) if area_sqm else None
+        if self.area_sqm is None and height_m is not None:
+            geometry = estimate_ground_area(float(height_m), float(tilt_deg or 0.0), float(hfov_deg or 70.0), float(vfov_deg or 55.0))
+            if geometry is not None:
+                self.area_sqm = float(geometry[0])
+        self.min_people = float(min_people) if min_people is not None else float(DEFAULT_MIN_PEOPLE)
+        self.analyzer = LiveAnalyzer(window=50, weights=None, min_people=self.min_people, critical_at=CRITICAL_AT)
 
         self.packet = self._offline_packet()
 
@@ -402,6 +449,8 @@ class CameraPipeline:
         self.prev_small = None
         self.prev_flow_time = None
         self.risk_history.clear()
+        with contextlib.suppress(Exception):
+            self.analyzer.reset()
         self.current_risk = "SAFE"
         self.alert_state = "SAFE"
         self.risk_score = 0.0
@@ -582,20 +631,38 @@ class CameraPipeline:
         density = float(np.clip(occupied_area / frame_area, 0.0, 1.0)) if frame_area > 0 else 0.0
         avg_confidence = float(np.mean(confidences)) if confidences else 0.0
 
-        if people_now <= 1:
-            # lone-person guard: suppress all motion vectors, hard SAFE
+        weights = config["weights"]
+        if people_now <= 0:
+            # no people -> suppress motion entirely and hard-reset the analyzer
             self.prev_small = None
             self.prev_flow_time = None
             turbulence = 0.0
-            convergence = 0.0
+            divergence = 0.0
             velocity = 0.0
-            risk_score = 0.0
-            instant_level = "SAFE"
         else:
-            turbulence, convergence, velocity = self._flow_metrics(frame)
-            risk_score, instant_level = self._score(
-                people_now, density, turbulence, convergence, velocity, config
-            )
+            turbulence, divergence, velocity = self._flow_metrics(frame)
+
+        risk_score = self.analyzer.add(
+            people_now,
+            turbulence,
+            divergence,
+            w_density=weights.get("density"),
+            w_rate_of_change=weights.get("rate_of_change"),
+            w_convergence=weights.get("convergence"),
+            w_turbulence=weights.get("turbulence"),
+            min_people=self.min_people,
+        )
+        formula_level = level_for(
+            risk_score,
+            threshold=float(config["alert_threshold"]),
+            critical_at=float(config["risk_thresholds"].get("critical", CRITICAL_AT)),
+        )
+        density_level = density_forced_level(people_now, self.area_sqm) if self.area_sqm else None
+        instant_level = combine_levels(formula_level, density_level)
+        density_psm = density_per_sqm(people_now, self.area_sqm) if self.area_sqm else 0.0
+        forecast_eta = self.analyzer.forecast_seconds_to_critical(
+            critical_at=float(config["risk_thresholds"].get("critical", CRITICAL_AT))
+        )
 
         self.risk_history.append(instant_level)
         now_mono = time.monotonic()
@@ -632,7 +699,8 @@ class CameraPipeline:
                     self.current_risk, RISK_SCORE_THRESHOLDS.get(self.current_risk, DEFAULT_ALERT_THRESHOLD)
                 )
             )
-            if float(risk_score) >= level_threshold:
+            density_forced = density_level is not None and density_level == self.current_risk
+            if density_forced or float(risk_score) >= level_threshold:
                 action = "DISPATCH" if self.current_risk == "CRITICAL" else "ESCALATE"
                 self.alert_id += 1
                 alert_event = {
@@ -672,6 +740,7 @@ class CameraPipeline:
         frame_age_ms = 0.0
         if self.frame_time > 0.0:
             frame_age_ms = max(0.0, (time.monotonic() - self.frame_time) * 1000.0)
+        terms = dict(getattr(self.analyzer, "last_terms", {}) or {})
         return {
             "id": self.id,
             "label": self.label,
@@ -683,11 +752,17 @@ class CameraPipeline:
             "tracks": [int(d[5]) for d in detections if d[5] is not None],
             "risk_level": self.current_risk,
             "risk_score": float(risk_score),
-            "confidence": float(avg_confidence),
+            "confidence": float(confidence_live(len(self.analyzer.risk), confidences)),
             "density": float(density),
+            "density_per_sqm": float(density_psm),
             "turbulence": float(turbulence),
-            "convergence": float(convergence),
+            "convergence": float(terms.get("convergence", 0.0)),
             "velocity": float(velocity),
+            "risk_level_formula": formula_level,
+            "risk_level_density": density_level or "SAFE",
+            "forecast_eta_s": float(forecast_eta) if forecast_eta is not None else None,
+            "area_sqm": float(self.area_sqm) if self.area_sqm else None,
+            "min_people": float(self.min_people),
             "timestamp": float(now_ms),
             "last_frame_age_ms": float(frame_age_ms),
             "alert": alert_fired,
@@ -725,6 +800,7 @@ class CameraPipeline:
         return annotated
 
     def _flow_metrics(self, frame):
+        """Return ``(turbulence, divergence, velocity)`` using the CrowdShield signal."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         small = cv2.resize(gray, (0, 0), fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
         previous = self.prev_small
@@ -733,82 +809,14 @@ class CameraPipeline:
             self.prev_flow_time = time.monotonic()
             return 0.0, 0.0, 0.0
 
-        flow = cv2.calcOpticalFlowFarneback(
-            previous,
-            small,
-            None,
-            pyr_scale=0.5,
-            levels=5,
-            winsize=15,
-            iterations=3,
-            poly_n=5,
-            poly_sigma=1.1,
-            flags=0,
-        )
         now_mono = time.monotonic()
         dt = now_mono - float(self.prev_flow_time) if self.prev_flow_time else 0.0
         self.prev_small = small.copy()
         self.prev_flow_time = now_mono
-        fx = flow[:, :, 0].astype(np.float32)
-        fy = flow[:, :, 1].astype(np.float32)
-        magnitude = np.hypot(fx, fy)
-
-        mean_magnitude = float(np.mean(magnitude)) if magnitude.size else 0.0
-        std_magnitude = float(np.std(magnitude)) if magnitude.size else 0.0
-        dt_safe = max(dt, 1e-6)
-        turbulence = float(std_magnitude / (abs(mean_magnitude) + 1e-6)) / dt_safe
-        velocity = float(np.hypot(float(np.mean(fx)), float(np.mean(fy)))) / dt_safe
-
-        flow_h, flow_w = fx.shape
-        yy, xx = np.mgrid[0:flow_h, 0:flow_w]
-        cx, cy = (flow_w - 1) / 2.0, (flow_h - 1) / 2.0
-        dx = cx - xx
-        dy = cy - yy
-        radial_norm = np.hypot(dx, dy) + 1e-6
-        radial = fx * (dx / radial_norm) + fy * (dy / radial_norm)
-        convergence = float(np.clip(float(np.mean(radial)) / (mean_magnitude + 1e-6), 0.0, 1.0))
-        return turbulence, convergence, velocity
-
-    def _score(self, people_now, density, turbulence, convergence, velocity, config):
-        headcount_index = float(min(people_now / HEADCOUNT_HIGH_THRESHOLD, 1.0))
-        density_index = float(min(density / (DENSITY_CRITICAL_THRESHOLD + 1e-6), 1.0))
-        combined_density = float(np.clip(0.6 * density_index + 0.4 * headcount_index, 0.0, 1.0))
-        rate_score = float(min(velocity / (MOTION_THRESHOLD + 1e-6), 1.0))
-        turbulence_score = float(min(turbulence / (TURBULENCE_CRITICAL_THRESHOLD + 1e-6), 1.0))
-        convergence_score = float(np.clip(convergence, 0.0, 1.0))
-
-        weights = config["weights"]
-        weight_density = float(weights.get("density", DEFAULT_WEIGHTS["density"]))
-        weight_rate = float(weights.get("rate_of_change", DEFAULT_WEIGHTS["rate_of_change"]))
-        weight_convergence = float(weights.get("convergence", DEFAULT_WEIGHTS["convergence"]))
-        weight_turbulence = float(weights.get("turbulence", DEFAULT_WEIGHTS["turbulence"]))
-        weight_total = weight_density + weight_rate + weight_convergence + weight_turbulence
-        if weight_total <= 1e-6:
-            weight_density, weight_rate = DEFAULT_WEIGHTS["density"], DEFAULT_WEIGHTS["rate_of_change"]
-            weight_convergence, weight_turbulence = DEFAULT_WEIGHTS["convergence"], DEFAULT_WEIGHTS["turbulence"]
-            weight_total = sum(DEFAULT_WEIGHTS.values())
-
-        raw = (
-            weight_density * combined_density
-            + weight_rate * rate_score
-            + weight_convergence * convergence_score
-            + weight_turbulence * turbulence_score
-        ) / weight_total
-
-        # non-linear normalization clamp keeps mid-band scores stable
-        score = float(np.clip(raw, 0.0, 1.0))
-        score = float(np.clip(score ** SCORE_GAMMA, 0.0, 1.0))
-
-        thresholds = config["risk_thresholds"]
-        if score >= thresholds["critical"]:
-            level = "CRITICAL"
-        elif score >= thresholds["high"]:
-            level = "HIGH"
-        elif score >= thresholds["moderate"]:
-            level = "MODERATE"
-        else:
-            level = "SAFE"
-        return score, level
+        flow = cv2.calcOpticalFlowFarneback(previous, small, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        turbulence, divergence = compute_flow_signal(previous, small, dt=dt, flow=flow)
+        velocity = float(np.mean(np.hypot(flow[..., 0], flow[..., 1])))
+        return float(turbulence), float(divergence), float(velocity)
 
     # -- telemetry snapshots -------------------------------------------------
     def _offline_packet(self) -> dict:
@@ -825,9 +833,15 @@ class CameraPipeline:
             "risk_score": 0.0,
             "confidence": 0.0,
             "density": 0.0,
+            "density_per_sqm": 0.0,
             "turbulence": 0.0,
             "convergence": 0.0,
             "velocity": 0.0,
+            "risk_level_formula": "SAFE",
+            "risk_level_density": "SAFE",
+            "forecast_eta_s": None,
+            "area_sqm": float(self.area_sqm) if self.area_sqm else None,
+            "min_people": float(self.min_people),
             "timestamp": float(time.time() * 1000.0),
             "last_frame_age_ms": 0.0,
             "alert": False,
@@ -1044,6 +1058,12 @@ class SharedSystemState:
                     "id": cam_id,
                     "label": str(spec.get("label") or f"CAM {index + 1}").strip() or f"CAM {index + 1}",
                     "source": source,
+                    "area_sqm": _optional_float(spec.get("area_sqm")),
+                    "height_m": _optional_float(spec.get("height_m")),
+                    "tilt_deg": _optional_float(spec.get("tilt_deg")),
+                    "hfov": _optional_float(spec.get("hfov")),
+                    "vfov": _optional_float(spec.get("vfov")),
+                    "min_people": _optional_float(spec.get("min_people")),
                 }
             )
         if not normalized:
@@ -1056,10 +1076,34 @@ class SharedSystemState:
             for spec in normalized:
                 pipeline = existing.get(spec["id"])
                 if pipeline is None:
-                    pipeline = CameraPipeline(spec["id"], spec["label"], spec["source"], self)
+                    pipeline = CameraPipeline(
+                        spec["id"],
+                        spec["label"],
+                        spec["source"],
+                        self,
+                        area_sqm=spec.get("area_sqm"),
+                        height_m=spec.get("height_m"),
+                        tilt_deg=spec.get("tilt_deg"),
+                        hfov_deg=spec.get("hfov"),
+                        vfov_deg=spec.get("vfov"),
+                        min_people=spec.get("min_people"),
+                    )
                     new_pipelines.append(pipeline)
                 else:
                     pipeline.label = spec["label"]
+                    if spec.get("area_sqm") is not None:
+                        pipeline.area_sqm = float(spec["area_sqm"])
+                    elif spec.get("height_m") is not None:
+                        geometry = estimate_ground_area(
+                            float(spec["height_m"]),
+                            float(spec.get("tilt_deg") or 0.0),
+                            float(spec.get("hfov") or 70.0),
+                            float(spec.get("vfov") or 55.0),
+                        )
+                        pipeline.area_sqm = float(geometry[0]) if geometry is not None else pipeline.area_sqm
+                    if spec.get("min_people") is not None:
+                        pipeline.min_people = float(spec["min_people"])
+                        pipeline.analyzer.min_people = pipeline.min_people
                     if normalize_source(pipeline.source) != normalize_source(spec["source"]):
                         pipeline.set_source(spec["source"])
                 wanted[spec["id"]] = pipeline
