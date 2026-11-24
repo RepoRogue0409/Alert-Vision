@@ -115,14 +115,40 @@
       gap: 8px;
     }
 
+    .channel-row.invalid {
+      border-color: rgba(239, 68, 68, 0.6);
+    }
+
     .channel-head {
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 8px;
       font-size: 0.72rem;
       letter-spacing: 1px;
       color: var(--accent-neon);
     }
+
+    .channel-head-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .status-chip {
+      font-size: 0.62rem;
+      letter-spacing: 0.6px;
+      padding: 2px 8px;
+      border-radius: 10px;
+      border: 1px solid var(--border-glow);
+      color: var(--text-gray);
+      background: rgba(100, 116, 139, 0.12);
+      white-space: nowrap;
+    }
+
+    .status-chip.connecting { color: var(--color-warn); border-color: rgba(234, 179, 8, 0.45); }
+    .status-chip.connected { color: var(--color-safe); border-color: rgba(16, 185, 129, 0.45); }
+    .status-chip.failed { color: var(--color-critical); border-color: rgba(239, 68, 68, 0.45); }
 
     .channel-remove {
       background: transparent;
@@ -141,10 +167,82 @@
 
     .channel-controls {
       display: flex;
+      flex-direction: column;
       gap: 6px;
     }
 
-    .channel-controls select { max-width: 110px; }
+    .channel-controls select,
+    .channel-controls input {
+      background: #070b19;
+      border: 1px solid var(--border-glow);
+      color: white;
+      padding: 7px 8px;
+      border-radius: 6px;
+      outline: none;
+      width: 100%;
+      font-size: 0.76rem;
+    }
+
+    .field-row {
+      display: flex;
+      gap: 6px;
+    }
+
+    .field-row > * { flex: 1; min-width: 0; }
+    .field-row .port-field { flex: 0 0 84px; }
+    .field-row .path-field { flex: 2; }
+
+    .field-label {
+      font-size: 0.62rem;
+      letter-spacing: 0.8px;
+      color: var(--text-gray);
+      text-transform: uppercase;
+    }
+
+    .url-preview {
+      font-family: monospace;
+      font-size: 0.68rem;
+      color: var(--text-gray);
+      background: rgba(0, 0, 0, 0.35);
+      border: 1px dashed var(--border-glow);
+      border-radius: 6px;
+      padding: 6px 8px;
+      overflow-wrap: anywhere;
+      min-height: 28px;
+    }
+
+    .channel-hint {
+      font-size: 0.66rem;
+      color: var(--text-gray);
+      line-height: 1.35;
+    }
+
+    .channel-error {
+      font-size: 0.68rem;
+      color: var(--color-critical);
+      min-height: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .channel-error:empty { display: none; }
+
+    .connect-btn {
+      background: rgba(0, 242, 254, 0.12);
+      border: 1px solid var(--accent-neon);
+      color: var(--accent-neon);
+      border-radius: 6px;
+      padding: 8px;
+      font-size: 0.74rem;
+      letter-spacing: 1px;
+      cursor: pointer;
+      width: 100%;
+    }
+
+    .connect-btn:hover { background: rgba(0, 242, 254, 0.22); }
+    .connect-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .cred-row { display: none; }
+    .cred-row.visible { display: flex; }
 
     .ghost-btn {
       background: transparent;
@@ -393,6 +491,10 @@
 
     <div class="config-group">
       <label>Camera Input Channels</label>
+      <div class="channel-hint">
+        Phone &amp; PC must share Wi-Fi. Pick your camera app preset, enter the phone's
+        IP + port, then press Connect. Tailscale IPs (100.x.x.x) work remotely.
+      </div>
       <div id="channel-list" class="channel-list"></div>
       <button type="button" id="add-channel" class="ghost-btn">+ ADD CAMERA CHANNEL</button>
     </div>

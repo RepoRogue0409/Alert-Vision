@@ -11,8 +11,11 @@
   var VIDEO_WATCHDOG_MS = 3000;
   var SNAPSHOT_INTERVAL_MS = 180;
   var CONFIG_DEBOUNCE_MS = 300;
+  var CAMERA_DEBOUNCE_MS = 800;
+  var CONNECT_TIMEOUT_MS = 10000;
   var MAX_CAMERAS = 6;
   var MAX_LEDGER_ROWS = 100;
+  var STORAGE_KEY = "alertVision.cameraConfig.v1";
 
   var ui = {
     linkStatus: document.getElementById("ui-link-status"),
@@ -77,25 +80,45 @@
     NONE: "MONITOR ONLY"
   };
 
+  /* Camera-type presets. `path` is the default stream path for each preset. */
+  var PRESETS = {
+    webcam: { label: "Webcam (this PC)", kind: "webcam", scheme: "http", port: 0, path: "" },
+    droidcam: { label: "DroidCam (phone)", kind: "network", scheme: "http", port: 4747, path: "/video" },
+    ipwebcam: { label: "IP Webcam (phone)", kind: "network", scheme: "http", port: 8080, path: "/video" },
+    mjpeg: { label: "Generic MJPEG", kind: "network", scheme: "http", port: 80, path: "/video" },
+    rtsp: { label: "Generic RTSP", kind: "network", scheme: "rtsp", port: 554, path: "/stream1" },
+    hikvision: { label: "Hikvision", kind: "network", scheme: "rtsp", port: 554, path: "/Streaming/Channels/101" },
+    dahua: { label: "Dahua", kind: "network", scheme: "rtsp", port: 554, path: "/cam/realmonitor?channel=1&subtype=0" },
+    tapo: { label: "TP-Link Tapo", kind: "network", scheme: "rtsp", port: 554, path: "/stream1" },
+    custom: { label: "Custom URL", kind: "network", scheme: "http", port: 80, path: "/" }
+  };
+
   var socket = null;
   var reconnectTimer = null;
   var cameraDebounce = null;
+  var controlDebounce = null;
   var currentAdviceKey = null;
   var backendAdopted = false;
   var camerasEdited = false;
-  var camSeq = 1;
   var viewRefs = {};
+  var channelRefs = {};
+  var seenAlertIds = {};
 
   var state = {
-    cameras: [{ id: "cam1", kind: "webcam", index: 0, url: "" }],
+    cameras: [makeCamera("cam1", { kind: "webcam", preset: "webcam" })],
     activeId: "cam1"
   };
 
   /* ------------------------------------------------------------------ */
-  /* Helpers                                                            */
+  /* Small helpers                                                      */
   /* ------------------------------------------------------------------ */
   function toNumber(value, fallback) {
     var parsed = parseFloat(value);
+    return isFinite(parsed) ? parsed : fallback;
+  }
+
+  function toInt(value, fallback) {
+    var parsed = parseInt(value, 10);
     return isFinite(parsed) ? parsed : fallback;
   }
 
@@ -123,24 +146,282 @@
     return null;
   }
 
-  function cameraSource(cam) {
-    if (cam.source_value !== undefined && cam.source_value !== null && cam.source_value !== "") {
-      var sv = cam.source_value;
-      if (typeof sv === "number") return Math.max(0, Math.round(sv));
-      if (/^\d+$/.test(String(sv))) return Math.max(0, parseInt(sv, 10));
-      return (sv || "").trim();
+  function makeCamera(id, opts) {
+    var base = {
+      id: id,
+      kind: "network",
+      preset: "custom",
+      index: 0,
+      scheme: "http",
+      host: "",
+      port: 4747,
+      path: "/video",
+      username: "",
+      password: "",
+      status: "IDLE",
+      connectAt: 0,
+      error: ""
+    };
+    if (opts) {
+      Object.keys(opts).forEach(function (key) {
+        base[key] = opts[key];
+      });
     }
+    return base;
+  }
+
+  function defaultPortFor(scheme) {
+    return scheme === "https" ? 443 : scheme === "rtsp" ? 554 : 80;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Source building / masking / validation                             */
+  /* ------------------------------------------------------------------ */
+  function buildUrl(cam) {
+    var scheme = (cam.scheme || "http").toLowerCase();
+    var host = String(cam.host || "").trim();
+    if (!host) return "";
+    var port = toInt(cam.port, defaultPortFor(scheme));
+    var auth = "";
+    if (scheme === "rtsp" && cam.username) {
+      auth = encodeURIComponent(cam.username);
+      if (cam.password) auth += ":" + encodeURIComponent(cam.password);
+      auth += "@";
+    }
+    var path = String(cam.path || "/");
+    if (path.charAt(0) !== "/") path = "/" + path;
+    return scheme + "://" + auth + host + (port ? ":" + port : "") + path;
+  }
+
+  function maskUrl(url) {
+    if (!url) return "";
+    return String(url).replace(/(:\/\/)([^/@\s]+)@/, "$1***@");
+  }
+
+  function buildSource(cam) {
     if (cam.kind === "webcam") {
       return Math.max(0, Math.round(toNumber(cam.index, 0)));
     }
-    return (cam.url || "").trim();
+    return buildUrl(cam);
+  }
+
+  function sourceKey(source) {
+    if (typeof source === "number") return "idx:" + source;
+    var text = String(source || "").trim();
+    if (/^\d+$/.test(text)) return "idx:" + parseInt(text, 10);
+    // Credentials do not make two cameras distinct.
+    text = text.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@]*@/i, "$1");
+    return text.toLowerCase();
+  }
+
+  function isValidHost(host) {
+    if (!host) return false;
+    var value = String(host).trim();
+    var ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+    if (ipv4.test(value)) {
+      return value.split(".").every(function (part) {
+        return parseInt(part, 10) <= 255;
+      });
+    }
+    if (value.length > 253) return false;
+    return /^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/.test(value);
+  }
+
+  function classifyHost(host) {
+    var value = String(host || "").trim();
+    var ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+    if (!ipv4.test(value)) {
+      return { valid: isValidHost(value), kind: "hostname" };
+    }
+    var parts = value.split(".").map(function (part) { return parseInt(part, 10); });
+    if (parts.some(function (part) { return part > 255; })) {
+      return { valid: false, kind: "ipv4" };
+    }
+    if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) {
+      return { valid: true, kind: "tailscale" };
+    }
+    if (parts[0] === 10 || (parts[0] === 192 && parts[1] === 168) || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31)) {
+      return { valid: true, kind: "private" };
+    }
+    return { valid: true, kind: "public" };
+  }
+
+  function validateCamera(cam) {
+    if (!cam) return "Unknown camera.";
+    if (cam.kind === "webcam") {
+      var index = toInt(cam.index, -1);
+      if (!isFinite(index) || index < 0) return "Webcam index must be 0 or higher.";
+      return "";
+    }
+    if (!cam.host) return "Enter the camera IP address or hostname.";
+    var hostInfo = classifyHost(cam.host);
+    if (!hostInfo.valid) return "That IP/hostname is not valid.";
+    var port = toInt(cam.port, -1);
+    if (!isFinite(port) || port < 1 || port > 65535) return "Port must be between 1 and 65535.";
+    var scheme = String(cam.scheme || "").toLowerCase();
+    if (["http", "https", "rtsp"].indexOf(scheme) < 0) return "Use an http, https or rtsp stream.";
+    if (!cam.path) return "Enter the stream path (for example /video).";
+    return "";
+  }
+
+  function duplicateSourceIds() {
+    var seen = {};
+    var dupes = {};
+    state.cameras.forEach(function (cam) {
+      if (validateCamera(cam)) return;
+      var key = sourceKey(buildSource(cam));
+      if (seen[key]) dupes[cam.id] = true;
+      else seen[key] = true;
+    });
+    return dupes;
+  }
+
+  function cameraSource(cam) {
+    return buildSource(cam);
   }
 
   function cameraLabel(cam, index) {
+    var title = "CAM " + (index + 1);
     if (cam.kind === "webcam") {
-      return "CAM " + (index + 1) + " \u00b7 Webcam " + Math.max(0, Math.round(toNumber(cam.index, 0)));
+      return title + " \u00b7 Webcam " + Math.max(0, Math.round(toNumber(cam.index, 0)));
     }
-    return "CAM " + (index + 1) + " \u00b7 RTSP";
+    var preset = PRESETS[cam.preset];
+    return title + " \u00b7 " + (preset ? preset.label.replace(" (phone)", "") : "Network");
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* URL parsing / preset detection                                     */
+  /* ------------------------------------------------------------------ */
+  function detectPreset(url) {
+    var text = String(url || "");
+    var lower = text.toLowerCase();
+    if (lower.indexOf("4747") >= 0) return "droidcam";
+    if (lower.indexOf("8080") >= 0 && lower.indexOf("/video") >= 0) return "ipwebcam";
+    if (lower.indexOf("streaming/channels") >= 0) return "hikvision";
+    if (lower.indexOf("realmonitor") >= 0) return "dahua";
+    if (lower.indexOf("rtsp://") === 0) return "rtsp";
+    if (lower.indexOf("http://") === 0 || lower.indexOf("https://") === 0) return "mjpeg";
+    return "custom";
+  }
+
+  function parseUrlInto(cam, url) {
+    try {
+      var parsed = new URL(url);
+      cam.scheme = (parsed.protocol || "http:").replace(":", "").toLowerCase();
+      cam.host = parsed.hostname || "";
+      cam.port = parsed.port ? parseInt(parsed.port, 10) : defaultPortFor(cam.scheme);
+      cam.path = (parsed.pathname || "/") + (parsed.search || "");
+      if (parsed.username) cam.username = decodeURIComponent(parsed.username);
+      if (parsed.password) cam.password = decodeURIComponent(parsed.password);
+      cam.preset = detectPreset(url);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function maybeSplitPastedUrl(cam, text, refs) {
+    var value = String(text || "").trim();
+    if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return false;
+    if (!parseUrlInto(cam, value)) return false;
+    if (refs && refs.hostInput) refs.hostInput.value = cam.host;
+    syncCardFields(cam, refs);
+    return true;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Persistence                                                        */
+  /* ------------------------------------------------------------------ */
+  function currentControls() {
+    return {
+      stride: ui.strideSlider ? Math.round(toNumber(ui.strideSlider.value, 1)) : 1,
+      threshold: ui.thresholdSlider ? thresholdFraction(ui.thresholdSlider) : 0.55,
+      weights: {
+        density: ui.weightDensity ? weightFraction(ui.weightDensity) : 0.4,
+        rate_of_change: ui.weightRate ? weightFraction(ui.weightRate) : 0.2,
+        convergence: ui.weightConvergence ? weightFraction(ui.weightConvergence) : 0.2,
+        turbulence: ui.weightTurbulence ? weightFraction(ui.weightTurbulence) : 0.2
+      }
+    };
+  }
+
+  function savePersisted() {
+    try {
+      var cameras = state.cameras.map(function (cam) {
+        return {
+          id: cam.id,
+          kind: cam.kind,
+          preset: cam.preset,
+          index: cam.index,
+          scheme: cam.scheme,
+          host: cam.host,
+          port: cam.port,
+          path: cam.path,
+          username: cam.username
+          /* password intentionally never persisted */
+        };
+      });
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ cameras: cameras, controls: currentControls() }));
+    } catch (error) {
+      /* storage may be unavailable (private mode); ignore */
+    }
+  }
+
+  function loadPersisted() {
+    try {
+      var raw = window.localStorage.getItem(STORAGE_KEY);
+      if (!raw) return null;
+      var parsed = JSON.parse(raw);
+      if (!parsed || !Array.isArray(parsed.cameras) || parsed.cameras.length === 0) return null;
+      return parsed;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function restoreCamera(stored) {
+    var cam = makeCamera(stored.id || "cam1", {
+      kind: stored.kind === "webcam" ? "webcam" : "network",
+      preset: PRESETS[stored.preset] ? stored.preset : "custom",
+      index: Math.max(0, toInt(stored.index, 0)),
+      scheme: stored.scheme || "http",
+      host: stored.host || "",
+      port: toInt(stored.port, 4747),
+      path: stored.path || "/",
+      username: stored.username || "",
+      password: ""
+    });
+    cam.status = "IDLE";
+    return cam;
+  }
+
+  function applyControls(controls) {
+    if (!controls) return;
+    if (controls.stride && ui.strideSlider) {
+      ui.strideSlider.value = String(controls.stride);
+      if (ui.strideValue) ui.strideValue.textContent = String(controls.stride);
+    }
+    if (ui.thresholdSlider && typeof controls.threshold === "number") {
+      ui.thresholdSlider.value = String(Math.round(controls.threshold * 100));
+      if (ui.thresholdValue) ui.thresholdValue.textContent = toNumber(controls.threshold, 0.55).toFixed(2);
+    }
+    var weights = controls.weights || {};
+    if (ui.weightDensity && typeof weights.density === "number") {
+      ui.weightDensity.value = String(Math.round(weights.density * 100));
+      if (ui.weightDensityValue) ui.weightDensityValue.textContent = toNumber(weights.density, 0.4).toFixed(2);
+    }
+    if (ui.weightRate && typeof weights.rate_of_change === "number") {
+      ui.weightRate.value = String(Math.round(weights.rate_of_change * 100));
+      if (ui.weightRateValue) ui.weightRateValue.textContent = toNumber(weights.rate_of_change, 0.2).toFixed(2);
+    }
+    if (ui.weightConvergence && typeof weights.convergence === "number") {
+      ui.weightConvergence.value = String(Math.round(weights.convergence * 100));
+      if (ui.weightConvergenceValue) ui.weightConvergenceValue.textContent = toNumber(weights.convergence, 0.2).toFixed(2);
+    }
+    if (ui.weightTurbulence && typeof weights.turbulence === "number") {
+      ui.weightTurbulence.value = String(Math.round(weights.turbulence * 100));
+      if (ui.weightTurbulenceValue) ui.weightTurbulenceValue.textContent = toNumber(weights.turbulence, 0.2).toFixed(2);
+    }
   }
 
   /* ------------------------------------------------------------------ */
@@ -198,7 +479,7 @@
       title.textContent = cameraLabel(cam, index);
       var badge = document.createElement("span");
       badge.className = "cam-badge";
-      badge.textContent = "OFFLINE";
+      badge.textContent = "IDLE";
       head.appendChild(title);
       head.appendChild(badge);
 
@@ -294,7 +575,7 @@
 
     socket.addEventListener("open", function () {
       setLinkState(true);
-      sendConfig(false);
+      onControlDeskReady();
     });
 
     socket.addEventListener("message", function (event) {
@@ -304,7 +585,7 @@
       } catch (error) {
         return;
       }
-      handleTelemetry(packet);
+      handlePacket(packet);
     });
 
     socket.addEventListener("close", function () {
@@ -325,9 +606,40 @@
     }, RECONNECT_DELAY_MS);
   }
 
+  function onControlDeskReady() {
+    sendConfig(false);
+    if (camerasEdited || backendAdopted) {
+      markCamerasConnecting();
+      sendConfig(true);
+    }
+  }
+
   /* ------------------------------------------------------------------ */
-  /* Multi-camera telemetry repaint                                     */
+  /* Packet handling                                                    */
   /* ------------------------------------------------------------------ */
+  function handlePacket(packet) {
+    if (!packet || typeof packet !== "object") return;
+    if (packet.type === "history") {
+      (packet.alerts || []).forEach(function (event) {
+        appendLedgerFromEvent(event);
+      });
+      return;
+    }
+    if (packet.type === "alert") {
+      appendLedgerFromEvent(packet);
+      return;
+    }
+    if (packet.type === "config_ack") {
+      return;
+    }
+    if (packet.type === "config_error") {
+      setLinkState(false);
+      if (ui.linkStatus) ui.linkStatus.textContent = "\u25cf CONFIG REJECTED \u2014 CHECK INPUT";
+      return;
+    }
+    handleTelemetry(packet);
+  }
+
   function handleTelemetry(packet) {
     if (!packet || !Array.isArray(packet.cameras)) return;
 
@@ -339,6 +651,12 @@
 
     packet.cameras.forEach(function (cam) {
       updateTile(cam);
+      updateCameraStatusFromTelemetry(cam, true);
+    });
+
+    state.cameras.forEach(function (cam) {
+      var present = packet.cameras.some(function (item) { return item.id === cam.id; });
+      if (!present) updateCameraStatusFromTelemetry(cam, false);
     });
 
     var active = null;
@@ -357,7 +675,7 @@
 
     packet.cameras.forEach(function (cam) {
       if (cam.alert === true) {
-        appendLedgerRow(cam);
+        appendLedgerFromEvent(cam);
       }
     });
   }
@@ -369,23 +687,35 @@
         source = cam.source;
       }
       var isIndex = typeof source === "number" || /^\d+$/.test(String(source || ""));
-      return {
-        id: cam.id || "cam" + (index + 1),
-        kind: isIndex ? "webcam" : "rtsp",
-        index: isIndex ? Math.max(0, parseInt(source, 10) || 0) : 0,
-        url: isIndex ? "" : String(source || "")
-      };
+      var restored = makeCamera(cam.id || "cam" + (index + 1), {});
+      if (isIndex) {
+        restored.kind = "webcam";
+        restored.preset = "webcam";
+        restored.index = Math.max(0, parseInt(source, 10) || 0);
+      } else if (source) {
+        restored.kind = "network";
+        if (!parseUrlInto(restored, String(source))) {
+          restored.preset = "custom";
+          restored.host = "";
+          restored.path = "/";
+        }
+      } else {
+        restored.kind = "network";
+        restored.preset = "custom";
+      }
+      restored.status = cam.online ? "CONNECTED" : "IDLE";
+      return restored;
     });
     if (state.cameras.length === 0) {
-      state.cameras = [{ id: "cam1", kind: "webcam", index: 0, url: "" }];
+      state.cameras = [makeCamera("cam1", { kind: "webcam", preset: "webcam" })];
     }
-    camSeq = Math.max(camSeq, state.cameras.length);
     var exists = state.cameras.some(function (cam) {
       return cam.id === state.activeId;
     });
     if (!exists) state.activeId = state.cameras[0].id;
     renderChannels();
     renderViewports();
+    savePersisted();
   }
 
   function updateTile(cam) {
@@ -447,20 +777,25 @@
     ui.advice.style.borderLeftColor = riskColor(level);
   }
 
-  function appendLedgerRow(cam) {
-    if (!ui.ledger) return;
+  function appendLedgerFromEvent(event) {
+    if (!ui.ledger || !event) return;
+    var alertId = toInt(event.alert_id, 0);
+    if (alertId > 0) {
+      if (seenAlertIds[alertId]) return;
+      seenAlertIds[alertId] = true;
+    }
 
-    var level = normalizeLevel(cam.risk_level);
+    var level = normalizeLevel(event.risk_level);
     var header = ui.ledger.firstElementChild;
     var row = document.createElement("div");
     row.className = "log-row";
 
     var timeCell = document.createElement("div");
-    var stamp = toNumber(cam.timestamp, Date.now());
+    var stamp = toNumber(event.timestamp, Date.now());
     timeCell.textContent = new Date(stamp).toLocaleTimeString();
 
     var camCell = document.createElement("div");
-    camCell.textContent = cam.label || cam.id;
+    camCell.textContent = event.camera_label || event.label || event.id || event.camera_id || "Camera";
     camCell.style.color = "#00f2fe";
 
     var levelCell = document.createElement("div");
@@ -469,7 +804,7 @@
     levelCell.style.fontWeight = "bold";
 
     var actionCell = document.createElement("div");
-    var actionKey = typeof cam.action === "string" ? cam.action.toUpperCase() : "NONE";
+    var actionKey = typeof event.action === "string" ? event.action.toUpperCase() : "NONE";
     actionCell.textContent = ACTION_LABELS[actionKey] || ACTION_LABELS.NONE;
 
     row.appendChild(timeCell);
@@ -490,111 +825,479 @@
   }
 
   /* ------------------------------------------------------------------ */
+  /* Camera status                                                      */
+  /* ------------------------------------------------------------------ */
+  function statusLabel(status) {
+    if (status === "CONNECTING") return "\u25cf CONNECTING";
+    if (status === "CONNECTED") return "\u25cf CONNECTED";
+    if (status === "FAILED") return "\u25cf FAILED";
+    return "\u25cf IDLE";
+  }
+
+  function setCameraStatus(cam, status) {
+    cam.status = status;
+    var refs = channelRefs[cam.id];
+    if (!refs || !refs.statusChip) return;
+    refs.statusChip.textContent = statusLabel(status);
+    refs.statusChip.className = "status-chip " + status.toLowerCase();
+  }
+
+  function markCamerasConnecting() {
+    state.cameras.forEach(function (cam) {
+      if (cam.kind !== "webcam") {
+        setCameraStatus(cam, "CONNECTING");
+        cam.connectAt = Date.now();
+      }
+    });
+  }
+
+  function updateCameraStatusFromTelemetry(telemetry, present) {
+    var cam = cameraById(telemetry.id);
+    if (!cam) return;
+    if (telemetry.online) {
+      if (cam.status !== "CONNECTED") {
+        setCameraStatus(cam, "CONNECTED");
+        cam.error = "";
+        updateCardRefs(cam);
+      }
+      return;
+    }
+    if (!present) {
+      if (cam.status === "CONNECTING" && Date.now() - cam.connectAt > CONNECT_TIMEOUT_MS) {
+        setCameraStatus(cam, "FAILED");
+        cam.error = "Camera was not registered by the backend. Check the URL and try again.";
+        updateCardRefs(cam);
+      }
+      return;
+    }
+    if (cam.status === "CONNECTING" && Date.now() - cam.connectAt > CONNECT_TIMEOUT_MS) {
+      setCameraStatus(cam, "FAILED");
+      cam.error = "No frames received. Check the IP, port, path, or that the phone is on the same Wi-Fi.";
+      updateCardRefs(cam);
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Camera channel editor                                              */
   /* ------------------------------------------------------------------ */
-  function scheduleCameras() {
+  function nextCameraId() {
+    var index = 1;
+    while (cameraById("cam" + index)) index += 1;
+    return "cam" + index;
+  }
+
+  function scheduleCameras(delay) {
     camerasEdited = true;
     if (cameraDebounce) clearTimeout(cameraDebounce);
     cameraDebounce = setTimeout(function () {
       cameraDebounce = null;
       sendConfig(true);
-    }, CONFIG_DEBOUNCE_MS);
+    }, typeof delay === "number" ? delay : CAMERA_DEBOUNCE_MS);
+  }
+
+  function commitCamera(cam, immediate) {
+    var error = validateCamera(cam);
+    if (!error) {
+      var dupes = duplicateSourceIds();
+      if (dupes[cam.id]) {
+        error = "Duplicate source \u2014 another channel already uses this stream.";
+      }
+    }
+    cam.error = error;
+    if (error) {
+      setCameraStatus(cam, "FAILED");
+      updateCardRefs(cam);
+      return false;
+    }
+    setCameraStatus(cam, "CONNECTING");
+    cam.connectAt = Date.now();
+    updateCardRefs(cam);
+    savePersisted();
+    scheduleCameras(immediate ? 0 : CAMERA_DEBOUNCE_MS);
+    return true;
   }
 
   function addCamera() {
     if (state.cameras.length >= MAX_CAMERAS) return;
-    camSeq += 1;
-    var id = "cam" + camSeq;
-    state.cameras.push({ id: id, kind: "rtsp", index: 0, url: "" });
+    var id = nextCameraId();
+    state.cameras.push(makeCamera(id, {
+      kind: "network",
+      preset: "droidcam",
+      scheme: "http",
+      port: 4747,
+      path: "/video"
+    }));
     renderChannels();
     renderViewports();
-    scheduleCameras();
+    selectCamera(id);
+    savePersisted();
   }
 
   function removeCamera(camId) {
     if (state.cameras.length <= 1) return;
+    var removedView = viewRefs[camId];
+    if (removedView && removedView.snapTimer) clearInterval(removedView.snapTimer);
     state.cameras = state.cameras.filter(function (cam) {
       return cam.id !== camId;
     });
+    delete channelRefs[camId];
     if (state.activeId === camId) {
       state.activeId = state.cameras[0].id;
     }
     renderChannels();
     renderViewports();
-    scheduleCameras();
+    savePersisted();
+    scheduleCameras(CAMERA_DEBOUNCE_MS);
+  }
+
+  function createField(labelText) {
+    var wrapper = document.createElement("div");
+    var label = document.createElement("div");
+    label.className = "field-label";
+    label.textContent = labelText;
+    wrapper.appendChild(label);
+    return wrapper;
+  }
+
+  function syncCardFields(cam, refs) {
+    if (!refs) return;
+    var isWebcam = cam.kind === "webcam";
+    if (refs.webcamBlock) refs.webcamBlock.style.display = isWebcam ? "block" : "none";
+    if (refs.networkBlock) refs.networkBlock.style.display = isWebcam ? "none" : "flex";
+    if (refs.presetSelect) refs.presetSelect.value = cam.preset;
+    if (refs.indexInput && document.activeElement !== refs.indexInput) {
+      refs.indexInput.value = String(cam.index);
+    }
+    if (refs.hostInput && document.activeElement !== refs.hostInput) {
+      refs.hostInput.value = cam.host;
+    }
+    if (refs.portInput && document.activeElement !== refs.portInput) {
+      refs.portInput.value = String(cam.port);
+    }
+    if (refs.pathInput && document.activeElement !== refs.pathInput) {
+      refs.pathInput.value = cam.path;
+    }
+    if (refs.userInput && document.activeElement !== refs.userInput) {
+      refs.userInput.value = cam.username;
+    }
+    if (refs.passInput && document.activeElement !== refs.passInput) {
+      refs.passInput.value = cam.password;
+    }
+    if (refs.credRow) {
+      refs.credRow.classList.toggle("visible", !isWebcam && cam.scheme === "rtsp");
+    }
+    if (refs.pathLabel) {
+      refs.pathLabel.textContent = cam.scheme === "rtsp" ? "Stream Path" : "URL Path";
+    }
+    updateCardRefs(cam);
+  }
+
+  function updateCardRefs(cam) {
+    var refs = channelRefs[cam.id];
+    if (!refs) return;
+    if (refs.urlPreview) {
+      var url = cam.kind === "webcam" ? "Webcam index " + cam.index : buildUrl(cam);
+      refs.urlPreview.textContent = url ? maskUrl(url) : "Enter camera details to generate the stream URL";
+    }
+    if (refs.error) refs.error.textContent = cam.error || "";
+    if (refs.row) refs.row.classList.toggle("invalid", !!cam.error);
+    if (refs.connectBtn) refs.connectBtn.disabled = cam.kind === "network" && !cam.host;
+    if (refs.hint) {
+      if (cam.kind === "webcam") {
+        refs.hint.textContent = "Uses a webcam attached to this PC.";
+      } else {
+        var info = classifyHost(cam.host);
+        if (info.kind === "tailscale") {
+          refs.hint.textContent = "Tailscale IP detected \u2014 make sure this PC is on the same tailnet.";
+        } else if (info.kind === "private") {
+          refs.hint.textContent = "Private LAN IP \u2014 phone and PC must be on the same Wi-Fi.";
+        } else {
+          refs.hint.textContent = "Phone/camera and PC must share Wi-Fi, or use a Tailscale (100.x.x.x) IP.";
+        }
+      }
+    }
+  }
+
+  function buildChannelCard(cam, index) {
+    var row = document.createElement("div");
+    row.className = "channel-row";
+    row.dataset.cam = cam.id;
+
+    var head = document.createElement("div");
+    head.className = "channel-head";
+    var name = document.createElement("span");
+    name.textContent = "CHANNEL " + (index + 1);
+
+    var actions = document.createElement("div");
+    actions.className = "channel-head-actions";
+    var statusChip = document.createElement("span");
+    statusChip.className = "status-chip " + (cam.status || "idle").toLowerCase();
+    statusChip.textContent = statusLabel(cam.status || "IDLE");
+    var remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "channel-remove";
+    remove.textContent = "\u2715";
+    remove.setAttribute("aria-label", "Remove channel " + (index + 1));
+    remove.addEventListener("click", function () {
+      removeCamera(cam.id);
+    });
+    actions.appendChild(statusChip);
+    actions.appendChild(remove);
+    head.appendChild(name);
+    head.appendChild(actions);
+
+    var controls = document.createElement("div");
+    controls.className = "channel-controls";
+
+    var presetSelect = document.createElement("select");
+    presetSelect.className = "channel-preset";
+    presetSelect.setAttribute("aria-label", "Camera type preset");
+    Object.keys(PRESETS).forEach(function (key) {
+      var option = document.createElement("option");
+      option.value = key;
+      option.textContent = PRESETS[key].label;
+      presetSelect.appendChild(option);
+    });
+    presetSelect.value = cam.preset;
+    controls.appendChild(presetSelect);
+
+    var webcamBlock = document.createElement("div");
+    webcamBlock.className = "field-row";
+    var indexField = createField("Webcam Index");
+    var indexInput = document.createElement("input");
+    indexInput.type = "number";
+    indexInput.min = "0";
+    indexInput.step = "1";
+    indexInput.setAttribute("aria-label", "Webcam index");
+    indexField.appendChild(indexInput);
+    webcamBlock.appendChild(indexField);
+    controls.appendChild(webcamBlock);
+
+    var networkBlock = document.createElement("div");
+    networkBlock.className = "channel-controls";
+    networkBlock.style.display = "flex";
+
+    var hostPortRow = document.createElement("div");
+    hostPortRow.className = "field-row";
+    var hostField = createField("IP Address / Hostname");
+    var hostInput = document.createElement("input");
+    hostInput.type = "text";
+    hostInput.placeholder = "192.168.1.50";
+    hostInput.autocomplete = "off";
+    hostInput.spellcheck = false;
+    hostInput.setAttribute("aria-label", "Camera IP address or hostname");
+    hostField.appendChild(hostInput);
+    var portField = createField("Port");
+    portField.className = "port-field";
+    var portInput = document.createElement("input");
+    portInput.type = "number";
+    portInput.min = "1";
+    portInput.max = "65535";
+    portInput.setAttribute("aria-label", "Camera port");
+    portField.appendChild(portInput);
+    hostPortRow.appendChild(hostField);
+    hostPortRow.appendChild(portField);
+    networkBlock.appendChild(hostPortRow);
+
+    var pathRow = document.createElement("div");
+    pathRow.className = "field-row";
+    var pathField = createField("URL Path");
+    var pathLabel = pathField.querySelector(".field-label");
+    var pathInput = document.createElement("input");
+    pathInput.type = "text";
+    pathInput.autocomplete = "off";
+    pathInput.spellcheck = false;
+    pathInput.setAttribute("aria-label", "Stream path");
+    pathField.appendChild(pathInput);
+    pathRow.appendChild(pathField);
+    networkBlock.appendChild(pathRow);
+
+    var credRow = document.createElement("div");
+    credRow.className = "field-row cred-row";
+    var userField = createField("Username (RTSP only)");
+    var userInput = document.createElement("input");
+    userInput.type = "text";
+    userInput.autocomplete = "username";
+    userInput.setAttribute("aria-label", "Camera username");
+    userField.appendChild(userInput);
+    var passField = createField("Password (RTSP only)");
+    var passInput = document.createElement("input");
+    passInput.type = "password";
+    passInput.autocomplete = "new-password";
+    passInput.setAttribute("aria-label", "Camera password");
+    passField.appendChild(passInput);
+    credRow.appendChild(userField);
+    credRow.appendChild(passField);
+    networkBlock.appendChild(credRow);
+
+    var urlPreview = document.createElement("div");
+    urlPreview.className = "url-preview";
+    urlPreview.setAttribute("aria-live", "polite");
+    networkBlock.appendChild(urlPreview);
+
+    var hint = document.createElement("div");
+    hint.className = "channel-hint";
+    networkBlock.appendChild(hint);
+
+    controls.appendChild(networkBlock);
+
+    var error = document.createElement("div");
+    error.className = "channel-error";
+    controls.appendChild(error);
+
+    var connectBtn = document.createElement("button");
+    connectBtn.type = "button";
+    connectBtn.className = "connect-btn";
+    connectBtn.textContent = "CONNECT / APPLY";
+    controls.appendChild(connectBtn);
+
+    row.appendChild(head);
+    row.appendChild(controls);
+
+    var refs = {
+      row: row,
+      statusChip: statusChip,
+      presetSelect: presetSelect,
+      webcamBlock: webcamBlock,
+      indexInput: indexInput,
+      networkBlock: networkBlock,
+      hostInput: hostInput,
+      portInput: portInput,
+      pathInput: pathInput,
+      pathLabel: pathLabel,
+      userInput: userInput,
+      passInput: passInput,
+      credRow: credRow,
+      urlPreview: urlPreview,
+      hint: hint,
+      error: error,
+      connectBtn: connectBtn
+    };
+    channelRefs[cam.id] = refs;
+
+    presetSelect.addEventListener("change", function () {
+      var key = presetSelect.value;
+      var preset = PRESETS[key] || PRESETS.custom;
+      cam.preset = key;
+      cam.kind = preset.kind;
+      if (preset.kind === "network" && key !== "custom") {
+        cam.scheme = preset.scheme;
+        cam.port = preset.port;
+        cam.path = preset.path;
+      }
+      syncCardFields(cam, refs);
+      if (cam.kind === "webcam" || cam.host) {
+        commitCamera(cam, true);
+      } else {
+        cam.error = "";
+        updateCardRefs(cam);
+      }
+    });
+
+    indexInput.addEventListener("input", function () {
+      cam.index = Math.max(0, toInt(indexInput.value, 0));
+      updateCardRefs(cam);
+    });
+    indexInput.addEventListener("change", function () {
+      cam.index = Math.max(0, toInt(indexInput.value, 0));
+      commitCamera(cam);
+    });
+    indexInput.addEventListener("keydown", function (event) {
+      if (event.key === "Enter") commitCamera(cam, true);
+    });
+
+    hostInput.addEventListener("input", function () {
+      if (maybeSplitPastedUrl(cam, hostInput.value, refs)) {
+        cam.error = "";
+        updateCardRefs(cam);
+        return;
+      }
+      cam.host = hostInput.value.trim();
+      cam.error = "";
+      updateCardRefs(cam);
+    });
+    hostInput.addEventListener("change", function () {
+      cam.host = hostInput.value.trim();
+      commitCamera(cam);
+    });
+    hostInput.addEventListener("keydown", function (event) {
+      if (event.key === "Enter") {
+        cam.host = hostInput.value.trim();
+        commitCamera(cam, true);
+      }
+    });
+
+    portInput.addEventListener("input", function () {
+      cam.port = toInt(portInput.value, cam.port);
+      cam.error = "";
+      updateCardRefs(cam);
+    });
+    portInput.addEventListener("change", function () {
+      cam.port = toInt(portInput.value, cam.port);
+      commitCamera(cam);
+    });
+    portInput.addEventListener("keydown", function (event) {
+      if (event.key === "Enter") {
+        cam.port = toInt(portInput.value, cam.port);
+        commitCamera(cam, true);
+      }
+    });
+
+    pathInput.addEventListener("input", function () {
+      cam.path = pathInput.value;
+      cam.error = "";
+      updateCardRefs(cam);
+    });
+    pathInput.addEventListener("change", function () {
+      cam.path = pathInput.value;
+      commitCamera(cam);
+    });
+    pathInput.addEventListener("keydown", function (event) {
+      if (event.key === "Enter") {
+        cam.path = pathInput.value;
+        commitCamera(cam, true);
+      }
+    });
+
+    userInput.addEventListener("input", function () {
+      cam.username = userInput.value;
+      cam.error = "";
+      updateCardRefs(cam);
+    });
+    userInput.addEventListener("change", function () {
+      cam.username = userInput.value;
+      commitCamera(cam);
+    });
+
+    passInput.addEventListener("input", function () {
+      cam.password = passInput.value;
+      cam.error = "";
+    });
+    passInput.addEventListener("change", function () {
+      cam.password = passInput.value;
+      commitCamera(cam);
+    });
+    passInput.addEventListener("keydown", function (event) {
+      if (event.key === "Enter") {
+        cam.password = passInput.value;
+        commitCamera(cam, true);
+      }
+    });
+
+    connectBtn.addEventListener("click", function () {
+      commitCamera(cam, true);
+    });
+
+    syncCardFields(cam, refs);
+    return row;
   }
 
   function renderChannels() {
     if (!ui.channelList) return;
     ui.channelList.innerHTML = "";
-
+    channelRefs = {};
     state.cameras.forEach(function (cam, index) {
-      var row = document.createElement("div");
-      row.className = "channel-row";
-      row.dataset.cam = cam.id;
-
-      var head = document.createElement("div");
-      head.className = "channel-head";
-      var name = document.createElement("span");
-      name.textContent = "CHANNEL " + (index + 1);
-      var remove = document.createElement("button");
-      remove.type = "button";
-      remove.className = "channel-remove";
-      remove.textContent = "\u2715";
-      remove.addEventListener("click", function () {
-        removeCamera(cam.id);
-      });
-      head.appendChild(name);
-      head.appendChild(remove);
-
-      var controls = document.createElement("div");
-      controls.className = "channel-controls";
-
-      var kind = document.createElement("select");
-      kind.className = "channel-kind";
-      kind.innerHTML = '<option value="webcam">Webcam</option><option value="rtsp">RTSP / HTTP</option>';
-      kind.value = cam.kind;
-
-      var indexInput = document.createElement("input");
-      indexInput.type = "number";
-      indexInput.min = "0";
-      indexInput.step = "1";
-      indexInput.className = "channel-index";
-      indexInput.value = String(cam.index);
-
-      var urlInput = document.createElement("input");
-      urlInput.type = "text";
-      urlInput.className = "channel-url";
-      urlInput.placeholder = "rtsp://192.168.1.50:554/stream1";
-      urlInput.value = cam.url;
-
-      var syncVisibility = function () {
-        var isWebcam = cam.kind === "webcam";
-        indexInput.style.display = isWebcam ? "block" : "none";
-        urlInput.style.display = isWebcam ? "none" : "block";
-      };
-      syncVisibility();
-
-      kind.addEventListener("change", function () {
-        cam.kind = kind.value;
-        syncVisibility();
-        scheduleCameras();
-      });
-      indexInput.addEventListener("input", function () {
-        cam.index = Math.max(0, Math.round(toNumber(indexInput.value, 0)));
-        scheduleCameras();
-      });
-      urlInput.addEventListener("input", function () {
-        cam.url = urlInput.value;
-        scheduleCameras();
-      });
-
-      controls.appendChild(kind);
-      controls.appendChild(indexInput);
-      controls.appendChild(urlInput);
-      row.appendChild(head);
-      row.appendChild(controls);
-      ui.channelList.appendChild(row);
+      ui.channelList.appendChild(buildChannelCard(cam, index));
     });
   }
 
@@ -602,13 +1305,21 @@
   /* Configuration emission                                             */
   /* ------------------------------------------------------------------ */
   function camerasPayload() {
-    return state.cameras.map(function (cam, index) {
-      return {
+    var used = {};
+    var payload = [];
+    state.cameras.forEach(function (cam, index) {
+      if (validateCamera(cam)) return;
+      var source = buildSource(cam);
+      var key = sourceKey(source);
+      if (used[key]) return;
+      used[key] = true;
+      payload.push({
         id: cam.id,
         label: cameraLabel(cam, index),
-        source: cameraSource(cam)
-      };
+        source: source
+      });
     });
+    return payload;
   }
 
   function buildConfig(includeCameras) {
@@ -631,14 +1342,27 @@
 
   function sendConfig(includeCameras) {
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    socket.send(JSON.stringify(buildConfig(includeCameras)));
+    var config = buildConfig(includeCameras);
+    if (includeCameras && (!config.cameras || config.cameras.length === 0)) {
+      return;
+    }
+    socket.send(JSON.stringify(config));
+  }
+
+  function scheduleControls() {
+    savePersisted();
+    if (controlDebounce) clearTimeout(controlDebounce);
+    controlDebounce = setTimeout(function () {
+      controlDebounce = null;
+      sendConfig(false);
+    }, CONFIG_DEBOUNCE_MS);
   }
 
   function bindWeight(slider, label) {
     if (!slider || !label) return;
     slider.addEventListener("input", function () {
       label.textContent = weightFraction(slider).toFixed(2);
-      sendConfig(false);
+      scheduleControls();
     });
   }
 
@@ -652,7 +1376,7 @@
         if (ui.strideValue) {
           ui.strideValue.textContent = String(ui.strideSlider.value);
         }
-        sendConfig(false);
+        scheduleControls();
       });
     }
 
@@ -666,7 +1390,7 @@
         if (ui.thresholdValue) {
           ui.thresholdValue.textContent = thresholdFraction(ui.thresholdSlider).toFixed(2);
         }
-        sendConfig(false);
+        scheduleControls();
       });
     }
   }
@@ -675,11 +1399,25 @@
   /* Boot                                                               */
   /* ------------------------------------------------------------------ */
   function init() {
+    var persisted = loadPersisted();
+    if (persisted) {
+      state.cameras = persisted.cameras.slice(0, MAX_CAMERAS).map(restoreCamera);
+      if (state.cameras.length === 0) {
+        state.cameras = [makeCamera("cam1", { kind: "webcam", preset: "webcam" })];
+      }
+      state.activeId = state.cameras[0].id;
+      camerasEdited = true;
+      applyControls(persisted.controls);
+    }
+
     renderChannels();
     renderViewports();
     bindControls();
     renderAdvice("SAFE");
     setLinkState(false);
+    if (persisted) {
+      markCamerasConnecting();
+    }
     connect();
   }
 
