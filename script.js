@@ -6,10 +6,15 @@
   var WS_URL = "ws://127.0.0.1:8765";
   var VIDEO_BASE = "http://127.0.0.1:8766";
   var STREAM_URL = VIDEO_BASE + "/video";
-  var SNAPSHOT_URL = VIDEO_BASE + "/frame.jpg";
   var RECONNECT_DELAY_MS = 2000;
-  var VIDEO_WATCHDOG_MS = 3000;
-  var SNAPSHOT_INTERVAL_MS = 180;
+  var VIDEO_WATCHDOG_MS = 5000;
+  var STREAM_RETRY_BASE_MS = 1000;
+  var STREAM_RETRY_MAX_MS = 10000;
+  var LINK_STALE_MS = 3000;
+  var LINK_LOST_MS = 8000;
+  var LINK_TICK_MS = 1000;
+  var ALARM_MIN_RANK = 2;
+  var CONFIG_FLASH_MS = 4000;
   var CONFIG_DEBOUNCE_MS = 300;
   var CAMERA_DEBOUNCE_MS = 800;
   var CONNECT_TIMEOUT_MS = 10000;
@@ -39,7 +44,25 @@
     risk: document.getElementById("ui-risk"),
     latency: document.getElementById("ui-latency"),
     advice: document.getElementById("ui-advice"),
-    ledger: document.getElementById("ui-ledger-box")
+    ledger: document.getElementById("ui-ledger-box"),
+    ledgerCount: document.getElementById("ui-ledger-count"),
+    ledgerClear: document.getElementById("ui-ledger-clear"),
+    alarm: document.getElementById("ui-alarm"),
+    alarmTitle: document.getElementById("ui-alarm-title"),
+    alarmMeta: document.getElementById("ui-alarm-meta"),
+    alarmAck: document.getElementById("ui-alarm-ack"),
+    barDensity: document.getElementById("bar-density"),
+    barDensityValue: document.getElementById("bar-density-val"),
+    barRate: document.getElementById("bar-rate"),
+    barRateValue: document.getElementById("bar-rate-val"),
+    barConvergence: document.getElementById("bar-convergence"),
+    barConvergenceValue: document.getElementById("bar-convergence-val"),
+    barTurbulence: document.getElementById("bar-turbulence"),
+    barTurbulenceValue: document.getElementById("bar-turbulence-val"),
+    infoDensityPsm: document.getElementById("info-density-psm"),
+    infoLevelFormula: document.getElementById("info-level-formula"),
+    infoLevelDensity: document.getElementById("info-level-density"),
+    infoEta: document.getElementById("info-eta")
   };
 
   var RISK_COLORS = {
@@ -100,9 +123,19 @@
   var currentAdviceKey = null;
   var backendAdopted = false;
   var camerasEdited = false;
+  var controlsFromStorage = false;
+  var serverConfigAdopted = false;
+  var controlsEdited = false;
   var viewRefs = {};
   var channelRefs = {};
   var seenAlertIds = {};
+  var ledgerEventCount = 0;
+  var lastTelemetryAt = 0;
+  var linkTimer = null;
+  var configFlashTimer = null;
+  var latencyEma = null;
+  var alarmState = { alertId: 0, cameraId: "", level: "SAFE" };
+  var audioCtx = null;
 
   var state = {
     cameras: [makeCamera("cam1", { kind: "webcam", preset: "webcam" })],
@@ -429,37 +462,69 @@
   /* ------------------------------------------------------------------ */
   function clearViewTimers() {
     Object.keys(viewRefs).forEach(function (id) {
-      var refs = viewRefs[id];
-      if (refs.watchTimer) clearTimeout(refs.watchTimer);
-      if (refs.snapTimer) clearInterval(refs.snapTimer);
+      clearStreamTimers(viewRefs[id]);
     });
     viewRefs = {};
   }
 
-  function startSnapshotMode(camId, refs) {
-    if (refs.snapTimer) return;
+  function clearStreamTimers(refs) {
+    if (!refs) return;
     if (refs.watchTimer) {
       clearTimeout(refs.watchTimer);
       refs.watchTimer = null;
     }
-    var tick = function () {
-      refs.img.src = SNAPSHOT_URL + "?cam=" + encodeURIComponent(camId) + "&t=" + Date.now();
-    };
-    tick();
-    refs.snapTimer = setInterval(tick, SNAPSHOT_INTERVAL_MS);
+    if (refs.retryTimer) {
+      clearTimeout(refs.retryTimer);
+      refs.retryTimer = null;
+    }
   }
 
-  function attachStream(camId, refs) {
-    refs.img.addEventListener("error", function () {
-      startSnapshotMode(camId, refs);
-    });
+  function setNoSignal(refs, visible, message) {
+    if (!refs || !refs.noSignal) return;
+    refs.noSignal.classList.toggle("visible", !!visible);
+    if (message && refs.noSignalText) {
+      refs.noSignalText.textContent = message;
+    }
+  }
+
+  function attemptStream(camId, refs) {
+    if (!refs) return;
+    clearStreamTimers(refs);
     refs.img.src = STREAM_URL + "?cam=" + encodeURIComponent(camId) + "&t=" + Date.now();
     refs.watchTimer = setTimeout(function () {
       refs.watchTimer = null;
       if (!refs.img.naturalWidth) {
-        startSnapshotMode(camId, refs);
+        scheduleStreamRetry(camId, refs);
       }
     }, VIDEO_WATCHDOG_MS);
+  }
+
+  /* F1: exponential backoff + explicit NO SIGNAL state instead of a dead frame. */
+  function scheduleStreamRetry(camId, refs) {
+    if (!refs || refs.retryTimer) return;
+    refs.failedAttempts = (refs.failedAttempts || 0) + 1;
+    var delay = Math.min(
+      STREAM_RETRY_BASE_MS * Math.pow(2, refs.failedAttempts - 1),
+      STREAM_RETRY_MAX_MS
+    );
+    setNoSignal(refs, true, "NO SIGNAL \u2014 retrying in " + Math.round(delay / 1000) + "s");
+    refs.retryTimer = setTimeout(function () {
+      refs.retryTimer = null;
+      attemptStream(camId, refs);
+    }, delay);
+  }
+
+  function attachStream(camId, refs) {
+    refs.failedAttempts = 0;
+    refs.img.addEventListener("load", function () {
+      refs.failedAttempts = 0;
+      clearStreamTimers(refs);
+      setNoSignal(refs, false, "");
+    });
+    refs.img.addEventListener("error", function () {
+      scheduleStreamRetry(camId, refs);
+    });
+    attemptStream(camId, refs);
   }
 
   function renderViewports() {
@@ -471,6 +536,10 @@
       var tile = document.createElement("div");
       tile.className = "cam-tile" + (cam.id === state.activeId ? " focused" : "");
       tile.dataset.cam = cam.id;
+      tile.tabIndex = 0;
+      tile.setAttribute("role", "button");
+      tile.setAttribute("aria-pressed", cam.id === state.activeId ? "true" : "false");
+      tile.setAttribute("aria-label", cameraLabel(cam, index) + " \u2014 activate to focus this camera");
 
       var head = document.createElement("div");
       head.className = "cam-head";
@@ -487,8 +556,18 @@
       videoBox.className = "video-box";
       var img = document.createElement("img");
       img.className = "cam-stream";
-      img.alt = "Waiting for camera stream " + cam.id;
+      img.alt = "Live stream for " + cameraLabel(cam, index);
       videoBox.appendChild(img);
+
+      var noSignal = document.createElement("div");
+      noSignal.className = "no-signal visible";
+      var noSignalTitle = document.createElement("strong");
+      noSignalTitle.textContent = "NO SIGNAL";
+      var noSignalText = document.createElement("span");
+      noSignalText.textContent = "Connecting to camera stream\u2026";
+      noSignal.appendChild(noSignalTitle);
+      noSignal.appendChild(noSignalText);
+      videoBox.appendChild(noSignal);
 
       var foot = document.createElement("div");
       foot.className = "cam-foot";
@@ -508,6 +587,12 @@
       tile.addEventListener("click", function () {
         selectCamera(cam.id);
       });
+      tile.addEventListener("keydown", function (event) {
+        if (event.key === "Enter" || event.key === " " || event.key === "Spacebar") {
+          event.preventDefault();
+          selectCamera(cam.id);
+        }
+      });
 
       ui.viewportGrid.appendChild(tile);
 
@@ -518,8 +603,11 @@
         badge: badge,
         people: people,
         score: score,
+        noSignal: noSignal,
+        noSignalText: noSignalText,
         watchTimer: null,
-        snapTimer: null
+        retryTimer: null,
+        failedAttempts: 0
       };
       viewRefs[cam.id] = refs;
       attachStream(cam.id, refs);
@@ -531,8 +619,11 @@
   function selectCamera(camId) {
     state.activeId = camId;
     currentAdviceKey = null;
+    latencyEma = null;
     Object.keys(viewRefs).forEach(function (id) {
-      viewRefs[id].tile.classList.toggle("focused", id === camId);
+      var focused = id === camId;
+      viewRefs[id].tile.classList.toggle("focused", focused);
+      viewRefs[id].tile.setAttribute("aria-pressed", focused ? "true" : "false");
     });
     updateFocusLabel();
   }
@@ -547,14 +638,56 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /* Link indicator                                                     */
+  /* Link indicator (F2: real stale/lost detection)                      */
   /* ------------------------------------------------------------------ */
-  function setLinkState(online) {
+  function setLinkState(mode) {
     if (!ui.linkStatus) return;
-    ui.linkStatus.textContent = online
-      ? "\u25cf CONTROL DESK SECURE LINK ONLINE"
-      : "\u25cf LINK LOST \u2014 RECONNECTING";
-    ui.linkStatus.classList.toggle("offline", !online);
+    var lost = mode === "lost";
+    var stale = mode === "stale";
+    ui.linkStatus.classList.toggle("offline", lost);
+    ui.linkStatus.classList.toggle("stale", stale);
+    if (mode === "online") {
+      ui.linkStatus.textContent = "\u25cf CONTROL DESK SECURE LINK ONLINE";
+    } else if (stale) {
+      ui.linkStatus.textContent = "\u25cf LINK STALE \u2014 NO TELEMETRY";
+    } else {
+      ui.linkStatus.textContent = "\u25cf LINK LOST \u2014 RECONNECTING";
+    }
+  }
+
+  function flashLink(message) {
+    if (!ui.linkStatus) return;
+    ui.linkStatus.textContent = message;
+    ui.linkStatus.classList.remove("offline", "stale");
+    if (configFlashTimer) clearTimeout(configFlashTimer);
+    configFlashTimer = setTimeout(function () {
+      configFlashTimer = null;
+      refreshLinkState();
+    }, CONFIG_FLASH_MS);
+  }
+
+  function refreshLinkState() {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      setLinkState("lost");
+      return;
+    }
+    if (!lastTelemetryAt) {
+      setLinkState("online");
+      return;
+    }
+    var age = Date.now() - lastTelemetryAt;
+    if (age > LINK_LOST_MS) {
+      setLinkState("lost");
+    } else if (age > LINK_STALE_MS) {
+      setLinkState("stale");
+    } else {
+      setLinkState("online");
+    }
+  }
+
+  function startLinkWatchdog() {
+    if (linkTimer) return;
+    linkTimer = setInterval(refreshLinkState, LINK_TICK_MS);
   }
 
   /* ------------------------------------------------------------------ */
@@ -568,13 +701,15 @@
     try {
       socket = new WebSocket(WS_URL);
     } catch (error) {
-      setLinkState(false);
+      setLinkState("lost");
       scheduleReconnect();
       return;
     }
 
     socket.addEventListener("open", function () {
-      setLinkState(true);
+      lastTelemetryAt = Date.now();
+      setLinkState("online");
+      startLinkWatchdog();
       onControlDeskReady();
     });
 
@@ -589,12 +724,13 @@
     });
 
     socket.addEventListener("close", function () {
-      setLinkState(false);
+      lastTelemetryAt = 0;
+      setLinkState("lost");
       scheduleReconnect();
     });
 
     socket.addEventListener("error", function () {
-      setLinkState(false);
+      setLinkState("lost");
     });
   }
 
@@ -607,7 +743,14 @@
   }
 
   function onControlDeskReady() {
-    sendConfig(false);
+    if (!controlsFromStorage && !serverConfigAdopted && !controlsEdited) {
+      /* F4: ask the backend for its live config before overriding anything. */
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "config" }));
+      }
+    } else {
+      sendConfig(false);
+    }
     if (camerasEdited || backendAdopted) {
       markCamerasConnecting();
       sendConfig(true);
@@ -630,11 +773,22 @@
       return;
     }
     if (packet.type === "config_ack") {
+      lastTelemetryAt = lastTelemetryAt || Date.now();
+      if (!controlsFromStorage && !serverConfigAdopted && !controlsEdited && packet.config) {
+        serverConfigAdopted = true;
+        applyControls({
+          stride: packet.config.stride,
+          threshold: packet.config.alert_threshold,
+          weights: packet.config.weights
+        });
+        savePersisted();
+      }
+      refreshLinkState();
       return;
     }
     if (packet.type === "config_error") {
-      setLinkState(false);
-      if (ui.linkStatus) ui.linkStatus.textContent = "\u25cf CONFIG REJECTED \u2014 CHECK INPUT";
+      var reason = typeof packet.error === "string" ? packet.error : "check the input values";
+      flashLink("\u25cf CONFIG REJECTED \u2014 " + reason.slice(0, 70));
       return;
     }
     handleTelemetry(packet);
@@ -642,6 +796,7 @@
 
   function handleTelemetry(packet) {
     if (!packet || !Array.isArray(packet.cameras)) return;
+    lastTelemetryAt = Date.now();
 
     if (!backendAdopted && !camerasEdited && packet.cameras.length > 0) {
       backendAdopted = true;
@@ -732,6 +887,37 @@
     refs.title.textContent = cam.label || cam.id;
     refs.people.textContent = "People: " + Math.max(0, Math.round(toNumber(cam.people_now, 0)));
     refs.score.textContent = "Score " + toNumber(cam.risk_score, 0).toFixed(2);
+
+    if (!cam.online) {
+      setNoSignal(refs, true, "CAMERA OFFLINE \u2014 CHECK SOURCE");
+    }
+    refs.tile.classList.toggle(
+      "alarm",
+      alarmState.cameraId === cam.id && RISK_RANK[alarmState.level] >= ALARM_MIN_RANK
+    );
+  }
+
+  function barColor(value) {
+    if (value >= 0.75) return RISK_COLORS.CRITICAL;
+    if (value >= 0.5) return RISK_COLORS.HIGH;
+    if (value >= 0.25) return RISK_COLORS.MODERATE;
+    return RISK_COLORS.SAFE;
+  }
+
+  function updateBar(fill, label, value) {
+    var clamped = Math.max(0, Math.min(1, toNumber(value, 0)));
+    if (fill) {
+      fill.style.width = (clamped * 100).toFixed(1) + "%";
+      fill.style.background = barColor(clamped);
+    }
+    if (label) label.textContent = clamped.toFixed(2);
+  }
+
+  function formatEta(seconds) {
+    var eta = toNumber(seconds, NaN);
+    if (!isFinite(eta) || eta < 0) return "\u2014";
+    if (eta < 60) return Math.round(eta) + "s";
+    return Math.floor(eta / 60) + "m " + Math.round(eta % 60) + "s";
   }
 
   function updateFocus(cam) {
@@ -743,12 +929,49 @@
     ui.risk.style.color = color;
     ui.risk.style.textShadow = "0 0 18px " + color;
 
-    var timestamp = toNumber(cam.timestamp, 0);
-    var latency = timestamp > 0 ? Date.now() - timestamp : 12;
-    if (!isFinite(latency) || latency < 0 || latency > 1000) latency = 12;
-    latency = Math.max(1, Math.round(latency));
-    ui.latency.textContent = latency + "ms";
-    ui.latency.style.color = latency > 45 ? RISK_COLORS.CRITICAL : "#00f2fe";
+    /* F2: real measured latency from the server timestamp, never a fake constant. */
+    var stamp = toNumber(cam.timestamp, 0);
+    if (stamp > 0) {
+      var sample = Date.now() - stamp;
+      if (isFinite(sample) && sample >= 0 && sample <= 60000) {
+        latencyEma = latencyEma === null ? sample : latencyEma * 0.7 + sample * 0.3;
+      }
+    }
+    var frameAge = Math.max(0, toNumber(cam.last_frame_age_ms, 0));
+    if (latencyEma === null) {
+      ui.latency.textContent = "\u2014";
+      ui.latency.style.color = "#64748b";
+      ui.latency.title = "No telemetry timing data yet";
+    } else {
+      var shown = Math.max(1, Math.round(latencyEma));
+      ui.latency.textContent = shown + "ms";
+      ui.latency.style.color = shown > 150 ? RISK_COLORS.CRITICAL : shown > 60 ? RISK_COLORS.MODERATE : "#00f2fe";
+      ui.latency.title = "Network " + shown + "ms \u00b7 frame age " + Math.round(frameAge) + "ms";
+    }
+
+    /* F7: live signal breakdown + density gate + forecast ETA. */
+    updateBar(ui.barDensity, ui.barDensityValue, cam.risk_density);
+    updateBar(ui.barRate, ui.barRateValue, cam.risk_rate_of_change);
+    updateBar(ui.barConvergence, ui.barConvergenceValue, cam.risk_convergence);
+    updateBar(ui.barTurbulence, ui.barTurbulenceValue, cam.risk_turbulence);
+
+    if (ui.infoDensityPsm) {
+      var psm = toNumber(cam.density_per_sqm, 0);
+      ui.infoDensityPsm.textContent = psm.toFixed(2);
+    }
+    var formulaLevel = normalizeLevel(cam.risk_level_formula);
+    if (ui.infoLevelFormula) {
+      ui.infoLevelFormula.textContent = formulaLevel;
+      ui.infoLevelFormula.style.color = riskColor(formulaLevel);
+    }
+    var densityLevel = normalizeLevel(cam.risk_level_density);
+    if (ui.infoLevelDensity) {
+      ui.infoLevelDensity.textContent = densityLevel;
+      ui.infoLevelDensity.style.color = riskColor(densityLevel);
+    }
+    if (ui.infoEta) {
+      ui.infoEta.textContent = formatEta(cam.forecast_eta_s);
+    }
 
     var adviceKey = cam.id + ":" + level;
     if (adviceKey !== currentAdviceKey) {
@@ -1393,6 +1616,21 @@
         scheduleControls();
       });
     }
+
+    bindAlarmAck();
+    bindLedgerClear();
+  }
+
+  function bindAlarmAck() {
+    if (!ui.alarmAck) return;
+    ui.alarmAck.addEventListener("click", function () {
+      alarmState = { alertId: 0, cameraId: "", level: "SAFE" };
+      setNoSignal(null, false, "");
+      ui.alarm.classList.remove("alarm");
+      ui.alarmTitle.textContent = "⚠ CROWD ALERT";
+      ui.alarmMeta.textContent = "No active alerts";
+      ui.alarm.style.display = "none";
+    });
   }
 
   /* ------------------------------------------------------------------ */

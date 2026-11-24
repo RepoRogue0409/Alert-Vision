@@ -480,10 +480,181 @@
       font-weight: bold;
       border-bottom: 1px solid var(--border-glow);
     }
+
+    /* ---- F1: stream NO SIGNAL overlay + F3: alarm banner ---- */
+    .video-box { position: relative; }
+
+    .no-signal {
+      position: absolute;
+      inset: 0;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      background: repeating-linear-gradient(45deg, #05070f, #05070f 10px, #080c16 10px, #080c16 20px);
+      color: var(--text-gray);
+      text-align: center;
+      padding: 10px;
+      z-index: 2;
+    }
+
+    .no-signal.visible { display: flex; }
+    .no-signal strong { color: var(--color-danger); letter-spacing: 2px; font-size: 0.82rem; }
+    .no-signal span { font-size: 0.66rem; }
+
+    .alarm-banner {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      border: 1px solid var(--color-critical);
+      background: rgba(239, 68, 68, 0.14);
+      border-radius: 10px;
+      padding: 12px 16px;
+      animation: alarm-pulse 1.2s ease-in-out infinite;
+    }
+
+    .alarm-banner.visible { display: flex; }
+
+    .alarm-banner strong { color: var(--color-critical); letter-spacing: 1px; }
+    .alarm-banner .alarm-meta { font-size: 0.76rem; color: var(--text-white); }
+
+    .alarm-ack {
+      background: var(--color-critical);
+      border: none;
+      color: #fff;
+      padding: 8px 14px;
+      border-radius: 6px;
+      font-weight: bold;
+      letter-spacing: 0.5px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .alarm-ack:hover { filter: brightness(1.1); }
+
+    @keyframes alarm-pulse {
+      0%, 100% { box-shadow: 0 0 0 rgba(239, 68, 68, 0); }
+      50% { box-shadow: 0 0 22px rgba(239, 68, 68, 0.35); }
+    }
+
+    .cam-tile.alarm {
+      border-color: var(--color-critical);
+      box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.55), 0 0 26px rgba(239, 68, 68, 0.25);
+    }
+
+    /* ---- F7: info panel bars ---- */
+    .info-card { margin-top: 16px; }
+
+    .info-row {
+      display: grid;
+      grid-template-columns: 110px 1fr 52px;
+      align-items: center;
+      gap: 10px;
+      font-size: 0.72rem;
+      color: var(--text-gray);
+      margin-bottom: 8px;
+    }
+
+    .info-row .bar-track {
+      height: 8px;
+      background: rgba(255, 255, 255, 0.06);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+
+    .info-row .bar-fill {
+      height: 100%;
+      width: 0%;
+      background: var(--accent-neon);
+      border-radius: 6px;
+      transition: width 0.3s ease, background-color 0.3s ease;
+    }
+
+    .info-row em {
+      font-style: normal;
+      color: var(--text-white);
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .info-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 18px;
+      font-size: 0.72rem;
+      color: var(--text-gray);
+      border-top: 1px solid var(--border-glow);
+      padding-top: 10px;
+      margin-top: 4px;
+    }
+
+    .info-meta b { color: var(--text-white); font-weight: 600; }
+
+    /* ---- F2: link staleness ---- */
+    .link-status.stale {
+      background: rgba(234, 179, 8, 0.12);
+      color: var(--color-warn);
+      border-color: rgba(234, 179, 8, 0.4);
+    }
+
+    /* ---- F6: ledger header ---- */
+    .ledger-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .ledger-head h3 { margin: 0; border-bottom: none; padding-bottom: 0; }
+
+    .ledger-clear {
+      background: transparent;
+      border: 1px solid var(--border-glow);
+      color: var(--text-gray);
+      border-radius: 5px;
+      padding: 4px 9px;
+      font-size: 0.68rem;
+      cursor: pointer;
+    }
+
+    .ledger-clear:hover { color: var(--accent-neon); border-color: var(--accent-neon); }
+
+    .ledger-count { font-size: 0.68rem; color: var(--text-gray); }
+
+    /* ---- F8: keyboard focus ---- */
+    .cam-tile:focus-visible,
+    button:focus-visible,
+    select:focus-visible,
+    input:focus-visible {
+      outline: 2px solid var(--accent-neon);
+      outline-offset: 2px;
+    }
+
+    .skip-link {
+      position: absolute;
+      left: -9999px;
+      top: 0;
+      background: var(--accent-neon);
+      color: #001018;
+      padding: 8px 12px;
+      z-index: 20;
+      font-weight: bold;
+    }
+
+    .skip-link:focus { left: 12px; top: 12px; }
+
+    @media (prefers-reduced-motion: reduce) {
+      .alarm-banner { animation: none; }
+      .info-row .bar-fill { transition: none; }
+    }
   </style>
 </head>
 
 <body>
+  <a class="skip-link" href="#viewport-grid">Skip to camera grid</a>
 
   <!-- Configuration Control Side Deck panel -->
   <div class="sidebar">
@@ -547,10 +718,18 @@
         <h1>ALERT VISION MULTI-CAMERA NODE</h1>
         <div id="ui-focus-label" class="focus-label">FOCUS: CAM 1</div>
       </div>
-      <div id="ui-link-status" class="link-status">● CONTROL DESK SECURE LINK ONLINE</div>
+      <div id="ui-link-status" class="link-status" role="status" aria-live="polite">● CONTROL DESK SECURE LINK ONLINE</div>
     </div>
 
-    <div id="viewport-grid" class="viewport-grid"></div>
+    <div id="ui-alarm" class="alarm-banner" role="alert" aria-live="assertive">
+      <div>
+        <strong id="ui-alarm-title">⚠ CROWD ALERT</strong>
+        <div class="alarm-meta" id="ui-alarm-meta">No active alerts</div>
+      </div>
+      <button type="button" id="ui-alarm-ack" class="alarm-ack">ACKNOWLEDGE</button>
+    </div>
+
+    <div id="viewport-grid" class="viewport-grid" aria-label="Camera grid"></div>
 
     <div class="lower-grid">
       <div>
@@ -576,11 +755,47 @@
             <li>📋 Standby — no action required</li>
           </ul>
         </div>
+
+        <div class="viewport-card info-card" aria-label="Live risk signal breakdown">
+          <h3>Live Risk Signal Breakdown</h3>
+          <div class="info-row">
+            <span>Density</span>
+            <div class="bar-track"><div class="bar-fill" id="bar-density"></div></div>
+            <em id="bar-density-val">0.00</em>
+          </div>
+          <div class="info-row">
+            <span>Rate of Change</span>
+            <div class="bar-track"><div class="bar-fill" id="bar-rate"></div></div>
+            <em id="bar-rate-val">0.00</em>
+          </div>
+          <div class="info-row">
+            <span>Convergence</span>
+            <div class="bar-track"><div class="bar-fill" id="bar-convergence"></div></div>
+            <em id="bar-convergence-val">0.00</em>
+          </div>
+          <div class="info-row">
+            <span>Turbulence</span>
+            <div class="bar-track"><div class="bar-fill" id="bar-turbulence"></div></div>
+            <em id="bar-turbulence-val">0.00</em>
+          </div>
+          <div class="info-meta">
+            <span>Density: <b id="info-density-psm">0.00</b> people/m²</span>
+            <span>Formula: <b id="info-level-formula">SAFE</b></span>
+            <span>Density gate: <b id="info-level-density">SAFE</b></span>
+            <span>ETA to critical: <b id="info-eta">—</b></span>
+          </div>
+        </div>
       </div>
 
       <div class="viewport-card">
-        <h3>Live Threat Ledger Console</h3>
-        <div class="log-ledger" id="ui-ledger-box">
+        <div class="ledger-head">
+          <h3>Live Threat Ledger Console</h3>
+          <div class="ledger-head" style="margin:0; gap:8px;">
+            <span class="ledger-count" id="ui-ledger-count">0 events</span>
+            <button type="button" id="ui-ledger-clear" class="ledger-clear">Clear</button>
+          </div>
+        </div>
+        <div class="log-ledger" id="ui-ledger-box" role="log" aria-live="polite" aria-label="Threat ledger">
           <div class="log-row header">
             <div>Timestamp</div>
             <div>Camera</div>
