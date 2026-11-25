@@ -147,6 +147,7 @@
     }
 
     .status-chip.connecting { color: var(--color-warn); border-color: rgba(234, 179, 8, 0.45); }
+    .status-chip.loading { color: #00f2fe; border-color: rgba(0, 242, 254, 0.45); }
     .status-chip.connected { color: var(--color-safe); border-color: rgba(16, 185, 129, 0.45); }
     .status-chip.failed { color: var(--color-critical); border-color: rgba(239, 68, 68, 0.45); }
 
@@ -241,6 +242,32 @@
     .connect-btn:hover { background: rgba(0, 242, 254, 0.22); }
     .connect-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
+    .test-btn {
+      background: transparent;
+      border: 1px solid rgba(148, 163, 184, 0.55);
+      color: #cbd5e1;
+      border-radius: 6px;
+      padding: 7px;
+      font-size: 0.72rem;
+      letter-spacing: 1px;
+      cursor: pointer;
+      width: 100%;
+    }
+
+    .test-btn:hover { border-color: var(--accent-neon); color: var(--accent-neon); }
+    .test-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .channel-test-result {
+      font-size: 0.68rem;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+      min-height: 0;
+    }
+
+    .channel-test-result:empty { display: none; }
+    .channel-test-result.ok { color: var(--color-safe); }
+    .channel-test-result.fail { color: var(--color-critical); }
+
     .cred-row { display: none; }
     .cred-row.visible { display: flex; }
 
@@ -313,6 +340,7 @@
     }
 
     .cam-tile {
+      position: relative;
       background: var(--panel-bg);
       border: 1px solid var(--border-glow);
       border-radius: 12px;
@@ -617,6 +645,28 @@
       background: rgba(234, 179, 8, 0.12);
       color: var(--color-warn);
       border-color: rgba(234, 179, 8, 0.4);
+    }
+
+    /* ---- C7: grey the grid out when telemetry stops arriving ---- */
+    .viewport-grid.telemetry-stale {
+      filter: grayscale(0.85) brightness(0.62);
+      opacity: 0.75;
+      transition: filter 0.4s ease, opacity 0.4s ease;
+    }
+
+    .viewport-grid.telemetry-stale .cam-tile::after {
+      content: "TELEMETRY STALE";
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      font-size: 0.6rem;
+      letter-spacing: 1px;
+      color: var(--color-warn);
+      border: 1px solid rgba(234, 179, 8, 0.5);
+      border-radius: 8px;
+      padding: 1px 7px;
+      background: rgba(11, 15, 25, 0.85);
+      z-index: 4;
     }
 
     /* ---- F6: ledger header ---- */

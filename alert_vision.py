@@ -47,6 +47,7 @@ import contextlib
 import csv
 import json
 import os
+import socket
 import threading
 import time
 from collections import deque
@@ -54,7 +55,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from queue import Queue
 from urllib.parse import parse_qs, urlparse
 
-import cv2
+# FFmpeg capture options must be configured before the OpenCV FFMPEG backend is
+# imported so RTSP/HTTP streams pick up TCP transport + low-latency flags early.
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|fflags;nobuffer|probesize;32768|analyzeduration;0",
+)
+import cv2  # noqa: E402  (must follow OPENCV_FFMPEG_CAPTURE_OPTIONS)
 import numpy as np
 import torch
 from ultralytics import YOLO
@@ -90,6 +97,7 @@ MAX_WS_MESSAGE_BYTES = 1_000_000
 MAX_WS_MESSAGES_PER_SEC = 60
 
 LOG_FILE = "crowdshield_alert_log.csv"
+BACKEND_VERSION = "2.1.0"
 LOG_HEADERS = [
     "Timestamp",
     "CameraID",
@@ -328,6 +336,13 @@ class CameraPipeline:
         self.reconnect_attempts = 0
         self.frame_time = 0.0
 
+        # STEP 2: connection diagnostics surfaced in every telemetry packet.
+        self._conn_state = "loading_model"
+        self._conn_error = None
+        self._conn_started = time.monotonic()
+        self._resolved_source = source
+        self._last_open_error = None
+
         self.seen_ids = set()
         self.risk_history = deque(maxlen=DEBOUNCE_WINDOW)
         self.current_risk = "SAFE"
@@ -389,12 +404,12 @@ class CameraPipeline:
 
     # -- capture -------------------------------------------------------------
     @staticmethod
-    def _open_capture(source):
+    def _open_capture(source, timeout_ms: int = 4000):
         if isinstance(source, str) and not source.strip():
             return None
         if isinstance(source, str) and source.strip().lower().startswith("rtsp://"):
-            # Force TCP transport for RTSP before the capture backend uses it.
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+            # Force TCP transport (+ low-latency flags) before the capture backend uses it.
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|probesize;32768|analyzeduration;0"
         cap = None
         if isinstance(source, int):
             if os.name == "nt":
@@ -405,17 +420,14 @@ class CameraPipeline:
                         cap.release()
                 cap = cv2.VideoCapture(source)
         elif isinstance(source, str):
+            # Single FFMPEG attempt with explicit open/read timeouts (STEP 2: fast camera connect).
             params = []
             if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
-                params.extend([int(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC), 5000])
+                params.extend([int(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC), int(timeout_ms)])
             if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
-                params.extend([int(cv2.CAP_PROP_READ_TIMEOUT_MSEC), 5000])
-            cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG, params) if params else cv2.VideoCapture(source)
-            if cap is None or not cap.isOpened():
-                with contextlib.suppress(Exception):
-                    if cap is not None:
-                        cap.release()
-                cap = cv2.VideoCapture(source)
+                params.extend([int(cv2.CAP_PROP_READ_TIMEOUT_MSEC), int(timeout_ms)])
+            cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG, params) if params else cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+            # No second fallback attempt: the default-backend open can hang ~30s on dead hosts.
         else:
             cap = cv2.VideoCapture(source)
         if cap is not None and cap.isOpened():
@@ -427,6 +439,122 @@ class CameraPipeline:
                 cap.release()
         return None
 
+    @staticmethod
+    def _candidate_sources(source):
+        """Known phone/camera alternate stream paths, primary URL first."""
+        if not isinstance(source, str) or "://" not in source:
+            return [source]
+        parsed = urlparse(source)
+        if parsed.scheme not in ("http", "https"):
+            return [source]
+        path = parsed.path or "/"
+        candidates = [source]
+        alt_paths = []
+        if parsed.port == 4747:
+            # DroidCam phone app endpoints
+            alt_paths.extend(["/mjpegfeed?640x480", "/mjpegfeed"])
+        elif path in ("/video", "/videofeed"):
+            # IP Webcam / generic MJPEG endpoints
+            alt_paths.append("/videofeed" if path == "/video" else "/video")
+        for alt in alt_paths:
+            alt_path, _, alt_query = alt.partition("?")
+            if alt_path == path and alt_query == (parsed.query or ""):
+                continue
+            candidates.append(parsed._replace(path=alt_path, query=alt_query).geturl())
+        return candidates
+
+    def _open_with_alternates(self, source):
+        """Try the primary stream URL, then known alternates with short timeouts."""
+        candidates = self._candidate_sources(source)
+        for index, candidate in enumerate(candidates):
+            with self.capture_lock:
+                if self._source_dirty:
+                    # A newer source was queued; abandon this stale attempt early.
+                    return None
+            cap = self._open_capture(candidate, timeout_ms=4000 if index == 0 else 2000)
+            if cap is not None:
+                self._last_open_error = None
+                if candidate != source:
+                    self._resolved_source = candidate
+                    print(
+                        f":: [Alert Vision] {self.id} alternate stream path worked -> "
+                        f"{_source_display(candidate)}"
+                    )
+                else:
+                    self._resolved_source = source
+                return cap
+            if index == 0 and len(candidates) > 1:
+                # Only try alternate paths when the host itself answers. If it is
+                # unreachable, every alternate would just burn another timeout and
+                # delay the readable FAILED state.
+                reason = self._source_error_hint(source, timeout=0.6)
+                if reason is not None:
+                    self._last_open_error = reason
+                    self._resolved_source = source
+                    return None
+        self._resolved_source = source
+        return None
+
+    def _set_connection(self, state: str, error=None) -> None:
+        now = time.monotonic()
+        if state != self._conn_state:
+            self._conn_state = state
+            # Keep the attempt clock running into "failed" so elapsed_ms reports
+            # how long the failed connect attempt took.
+            if state in ("loading_model", "connecting", "connected"):
+                self._conn_started = now
+        if state in ("connecting", "connected", "loading_model"):
+            # A fresh attempt starts clean; stale errors belong to the last failure.
+            self._conn_error = None
+        if error:
+            self._conn_error = str(error)
+
+    def _connection_payload(self) -> dict:
+        elapsed_ms = max(0.0, (time.monotonic() - self._conn_started) * 1000.0)
+        return {
+            "state": str(self._conn_state),
+            "error": self._conn_error,
+            "elapsed_ms": float(round(elapsed_ms, 1)),
+            "resolved_url_masked": _source_display(self._resolved_source),
+        }
+
+    def _connection_error_hint(self) -> str:
+        """Best-effort readable reason for a failed stream open."""
+        if self._last_open_error:
+            return self._last_open_error
+        return self._source_error_hint(self.source) or (
+            "stream open failed: wrong path, camera busy (one-client limit), "
+            "or unsupported stream"
+        )
+
+    @staticmethod
+    def _source_error_hint(source, timeout: float = 1.5):
+        """Return a readable failure reason, or None when the host answers."""
+        if isinstance(source, int):
+            return f"webcam index {source} not available"
+        if not isinstance(source, str) or "://" not in source:
+            return "invalid stream URL"
+        parsed = urlparse(source)
+        host = parsed.hostname
+        if not host:
+            return "invalid stream URL"
+        if parsed.port:
+            port = int(parsed.port)
+        elif parsed.scheme == "https":
+            port = 443
+        elif parsed.scheme == "rtsp":
+            port = 554
+        else:
+            port = 80
+        try:
+            probe = socket.create_connection((host, port), timeout=timeout)
+            probe.close()
+            return None
+        except socket.timeout:
+            return "timeout: host did not respond (camera off / wrong IP / firewall)"
+        except OSError as error:
+            return f"connection refused/unreachable: {error}"
+
     def _apply_pending_source(self) -> None:
         with self.capture_lock:
             if not self._source_dirty:
@@ -435,7 +563,9 @@ class CameraPipeline:
             source = self._pending_source
             self._pending_source = None
         # Open outside the lock so a slow stream does not block the whole channel.
-        new_cap = self._open_capture(source)
+        self._conn_started = time.monotonic()
+        self._set_connection("connecting", None)
+        new_cap = self._open_with_alternates(source)
         with self.capture_lock:
             self.source = source
             if self.cap is not None:
@@ -444,6 +574,10 @@ class CameraPipeline:
                 self.cap = None
             self.cap = new_cap
             self.online = self.cap is not None
+        if self.online:
+            self._set_connection("connected", None)
+        else:
+            self._set_connection("failed", self._connection_error_hint())
 
         self.frame_counter = 0
         self.prev_small = None
@@ -482,11 +616,25 @@ class CameraPipeline:
                 with contextlib.suppress(Exception):
                     self.cap.release()
                 self.cap = None
-            self.cap = self._open_capture(self.source)
-            self.online = self.cap is not None
+        # Open OUTSIDE the capture lock so a slow stream does not block the whole channel.
+        self._conn_started = time.monotonic()
+        self._set_connection("connecting", None)
+        new_cap = self._open_with_alternates(self.source)
+        with self.capture_lock:
+            if self.stop_event.is_set():
+                return
+            self.cap = new_cap
+            self.online = new_cap is not None and new_cap.isOpened()
             if self.online:
                 self.reconnect_attempts = 0
                 self.prev_small = None
+            else:
+                # B4: grow the backoff on every failed attempt (2s -> 4s -> 8s ... 30s).
+                self.reconnect_attempts = min(self.reconnect_attempts + 1, 6)
+        if self.online:
+            self._set_connection("connected", None)
+        else:
+            self._set_connection("failed", self._connection_error_hint())
 
     def _reconnect_delay(self) -> float:
         if self.reconnect_attempts <= 0:
@@ -513,36 +661,36 @@ class CameraPipeline:
         return frame
 
     # -- worker loop ---------------------------------------------------------
-    def _run(self) -> None:
-        if self.model is None:
+    def _load_model(self) -> None:
+        """Load YOLO in a background thread so the capture can connect in parallel."""
+        while not self.stop_event.is_set() and self.model is None:
             try:
-                self.model_path = os.environ.get("ALERT_VISION_MODEL") or YOLO_MODEL_PATH
-                self.model = YOLO(self.model_path)
+                model_path = os.environ.get("ALERT_VISION_MODEL") or YOLO_MODEL_PATH
+                loaded = YOLO(model_path)
+                self.model_path = model_path
+                self.model = loaded
+                self.model_error = None
+                print(f":: [Alert Vision] {self.id} model loaded -> {model_path}")
+                if self._conn_state == "loading_model":
+                    self._set_connection("connecting", None)
+                return
             except Exception as error:
                 self.model_error = f"model_load_failed: {error}"
-                print(f":: [Alert Vision] {self.id} model load failed -> {error}")
+                print(
+                    f":: [Alert Vision] {self.id} model load failed -> {error} "
+                    f"(retrying in 30s)"
+                )
+                if self.stop_event.wait(30.0):
+                    return
+
+    def _run(self) -> None:
+        # STEP 2: open the capture immediately; the model loads in a parallel thread
+        # so torch/ultralytics startup never delays the stream connection.
+        if self.model is None:
+            threading.Thread(
+                target=self._load_model, name=f"cam-{self.id}-model", daemon=True
+            ).start()
         while not self.stop_event.is_set():
-            if self.model is None:
-                # B2: YOLO model unavailable -> never run frames; surface error, pause + back off.
-                if self.model_error is None:
-                    self.model_error = "model_unavailable"
-                    print(f":: [Alert Vision] {self.id} model unavailable -> frames paused")
-                with self.frame_lock:
-                    self.latest_frame = None
-                    self.latest_jpeg = None
-                self.current_risk = "UNKNOWN"
-                packet = self._offline_packet()
-                packet["risk_level"] = "UNKNOWN"
-                packet["risk_score"] = 0.0
-                packet["alert"] = False
-                packet["action"] = "NONE"
-                packet["alert_id"] = 0
-                packet["online"] = False
-                packet["last_frame_age_ms"] = 3000.0
-                self._publish(packet)
-                self._try_reconnect()
-                time.sleep(0.1)
-                continue
             self._apply_pending_source()
             frame = self.read_frame()
             if frame is None:
@@ -554,6 +702,31 @@ class CameraPipeline:
                 time.sleep(0.1)
                 continue
 
+            if self.model is None:
+                # B2: never run inference without a model. Keep the transport warm
+                # and relay the raw frame so the tile shows video while torch loads.
+                if self.model_error is None:
+                    self.model_error = "model_unavailable"
+                    print(f":: [Alert Vision] {self.id} model unavailable -> frames paused")
+                self._set_connection("loading_model", self.model_error)
+                self.current_risk = "UNKNOWN"
+                self._store_raw_frame(frame)
+                packet = self._offline_packet()
+                packet.update(
+                    risk_level="UNKNOWN",
+                    risk_score=0.0,
+                    alert=False,
+                    action="NONE",
+                    alert_id=0,
+                    online=True,
+                    camera_online=True,
+                    last_frame_age_ms=0.0,
+                )
+                self._publish(packet)
+                time.sleep(0.05)
+                continue
+
+            self._set_connection("connected", None)
             self.frame_counter += 1
             stride = max(1, int(self.state.config_snapshot()["stride"]))
             if self.frame_counter % stride != 0:
@@ -581,6 +754,20 @@ class CameraPipeline:
             return 0.0
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
         return fps if fps > 0.0 else 0.0
+
+    def _store_raw_frame(self, frame) -> None:
+        """Relay an un-annotated frame while the model is still loading."""
+        with self.frame_lock:
+            self.latest_frame = frame
+            with contextlib.suppress(Exception):
+                ok_jpeg, buffer = cv2.imencode(
+                    ".jpg",
+                    frame,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), int(JPEG_QUALITY)],
+                )
+                self.latest_jpeg = (
+                    buffer.tobytes() if ok_jpeg and buffer is not None else None
+                )
 
     def _publish(self, packet: dict) -> None:
         with self.frame_lock:
@@ -880,6 +1067,9 @@ class CameraPipeline:
             "alert": False,
             "action": "NONE",
             "camera_online": False,
+            "log_error": bool(self.log_error),
+            "model_error": self.model_error,
+            "connection": self._connection_payload(),
         }
 
     def acknowledge_alert(self) -> None:
@@ -915,6 +1105,7 @@ class CameraPipeline:
         packet["last_frame_age_ms"] = float(frame_age_ms)
         packet["log_error"] = bool(self.log_error)
         packet["model_error"] = self.model_error
+        packet["connection"] = self._connection_payload()
         if not self.online:
             packet["people_now"] = 0
             packet["risk_level"] = "SAFE"
@@ -1209,8 +1400,8 @@ class SharedSystemState:
             try:
                 self._retry_queue.put_nowait(row)
             except Exception:
-                with self._log_lock:
-                    self.log_error = True
+                # B7: never re-acquire the non-reentrant _log_lock here (deadlock).
+                self.log_error = True
         print(
             f":: [Alert Vision] THREAT LOGGED :: {row[0]} | {cam_id} | {risk_level} | "
             f"CONF {float(confidence or 0.0):.2f} | ACTION {action}"
@@ -1308,7 +1499,9 @@ class WebSocketBroadcaster:
                     raise
                 await asyncio.wait_for(self._send(session.connection, message), timeout=SEND_TIMEOUT_SEC)
         except Exception:
-            pass
+            # B8: a timed-out send means the client is dead -> close it, don't leak the socket.
+            with contextlib.suppress(Exception):
+                await session.connection.close()
         finally:
             async with self._lock:
                 if self.clients.get(session.connection) is session:
@@ -1326,9 +1519,10 @@ class FrameRelayServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, state: SharedSystemState) -> None:
+    def __init__(self, address, state: SharedSystemState, broadcaster=None) -> None:
         super().__init__(address, FrameRelayHandler)
         self.state = state
+        self.broadcaster = broadcaster
         self.mjpeg_clients = 0
         self._mjpeg_lock = threading.Lock()
 
@@ -1374,9 +1568,16 @@ class FrameRelayHandler(BaseHTTPRequestHandler):
         payload = json.dumps(
             {
                 "status": "ok",
+                "version": BACKEND_VERSION,
                 "cameras": len(cameras),
                 "cameras_online": int(online),
                 "model_loaded": any(pipe.model is not None for pipe in cameras),
+                "ws_clients": (
+                    self.server.broadcaster.active_count()
+                    if getattr(self.server, "broadcaster", None) is not None
+                    else 0
+                ),
+                "mjpeg_clients": int(getattr(self.server, "mjpeg_clients", 0)),
             }
         ).encode("utf-8")
         self.send_response(200)
@@ -1479,13 +1680,16 @@ class AlertVisionBackend:
         return origin in allowed
 
     async def _handle_connection(self, connection, path=None) -> None:
+        # B8: check the Origin header BEFORE registering the client.
+        if not self._origin_allowed(self._client_origin(connection)):
+            with contextlib.suppress(Exception):
+                await connection.close()
+            return
         history_message = None
         if self.state.alert_history:
             history_message = json.dumps({"type": "history", "alerts": list(self.state.alert_history)})
         await self.broadcaster.register(connection, history_message=history_message)
         try:
-            if not self._origin_allowed(self._client_origin(connection)):
-                return
             async with connection:
                 msg_count = 0
                 window_start = time.monotonic()
@@ -1531,13 +1735,107 @@ class AlertVisionBackend:
                         await self.broadcaster.send_raw(
                             connection, json.dumps({"type": "config_ack", "config": validated})
                         )
+                    elif message_type == "test_source":
+                        # STEP 2/B9: probe a source off the event loop, 5s cap.
+                        loop = asyncio.get_running_loop()
+                        request_id = payload.get("id")
+                        source = payload.get("source")
+                        try:
+                            source = normalize_source(source)
+                            if isinstance(source, str):
+                                _validate_source(source)
+                        except Exception as error:
+                            await self.broadcaster.send_raw(
+                                connection,
+                                json.dumps(
+                                    {
+                                        "type": "test_result",
+                                        "id": request_id,
+                                        "ok": False,
+                                        "error": str(error),
+                                        "width": 0,
+                                        "height": 0,
+                                        "fps": 0.0,
+                                        "elapsed_ms": 0.0,
+                                    }
+                                ),
+                            )
+                            continue
+                        try:
+                            result = await asyncio.wait_for(
+                                loop.run_in_executor(None, self._test_source_sync, source),
+                                timeout=5.0,
+                            )
+                        except asyncio.TimeoutError:
+                            result = {
+                                "ok": False,
+                                "error": "timed out after 5s",
+                                "width": 0,
+                                "height": 0,
+                                "fps": 0.0,
+                                "elapsed_ms": 5000.0,
+                            }
+                        result["type"] = "test_result"
+                        result["id"] = request_id
+                        await self.broadcaster.send_raw(connection, json.dumps(_sanitize(result)))
+                    elif message_type == "get_state":
+                        await self.broadcaster.send_raw(
+                            connection,
+                            json.dumps(
+                                _sanitize(
+                                    {
+                                        "type": "state",
+                                        "config": self.state.config_snapshot(),
+                                        "cameras": [pipe.snapshot() for pipe in self.state.camera_list()],
+                                    }
+                                )
+                            ),
+                        )
         except Exception:
             pass
         finally:
             await self.broadcaster.unregister(connection)
 
+    @staticmethod
+    def _test_source_sync(source) -> dict:
+        """Open a source once and report resolution/fps/timing (runs in a worker thread)."""
+        started = time.monotonic()
+        cap = None
+        error = None
+        width = height = 0
+        fps = 0.0
+        try:
+            cap = CameraPipeline._open_capture(source, timeout_ms=4000)
+            if cap is None:
+                error = CameraPipeline._source_error_hint(source) or (
+                    "stream open failed: wrong path, camera busy (one-client limit), "
+                    "or unsupported stream"
+                )
+            else:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    error = "stream opened but no frame arrived (wrong path or camera busy)"
+                else:
+                    height, width = frame.shape[:2]
+                    with contextlib.suppress(Exception):
+                        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        finally:
+            if cap is not None:
+                with contextlib.suppress(Exception):
+                    cap.release()
+        return {
+            "ok": error is None,
+            "error": error,
+            "width": int(width),
+            "height": int(height),
+            "fps": float(round(fps, 2)),
+            "elapsed_ms": float(round((time.monotonic() - started) * 1000.0, 1)),
+        }
+
     def start_frame_relay(self):
-        relay_server = FrameRelayServer((HOST, VIDEO_PORT), self.state)
+        relay_server = FrameRelayServer((HOST, VIDEO_PORT), self.state, self.broadcaster)
         relay_thread = threading.Thread(
             target=relay_server.serve_forever,
             kwargs={"poll_interval": 0.5},
@@ -1560,7 +1858,7 @@ class AlertVisionBackend:
                     await asyncio.sleep(BROADCAST_INTERVAL)
         finally:
             self.state.shutdown()
-            cv2.destroyAllWindows()
+            # B11: no OpenCV GUI windows exist in this headless backend.
             if relay_server is not None:
                 relay_server.shutdown()
                 relay_server.server_close()

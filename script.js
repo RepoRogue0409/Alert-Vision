@@ -708,6 +708,15 @@
     } else {
       setLinkState("online");
     }
+    setTelemetryStalled(age > LINK_STALE_MS);
+  }
+
+  /* C7: when telemetry stops arriving the tiles show stale numbers, so grey
+     the grid out rather than letting old values look live. */
+  function setTelemetryStalled(stalled) {
+    if (!ui.viewportGrid) return;
+    if (ui.viewportGrid.classList.contains("telemetry-stale") === stalled) return;
+    ui.viewportGrid.classList.toggle("telemetry-stale", stalled);
   }
 
   function startLinkWatchdog() {
@@ -751,11 +760,13 @@
     socket.addEventListener("close", function () {
       lastTelemetryAt = 0;
       setLinkState("lost");
+      setTelemetryStalled(true);
       scheduleReconnect();
     });
 
     socket.addEventListener("error", function () {
       setLinkState("lost");
+      setTelemetryStalled(true);
     });
   }
 
@@ -817,12 +828,17 @@
       flashLink("\u25cf CONFIG REJECTED \u2014 " + reason.slice(0, 70));
       return;
     }
+    if (packet.type === "test_result") {
+      showTestResult(packet);
+      return;
+    }
     handleTelemetry(packet);
   }
 
   function handleTelemetry(packet) {
     if (!packet || !Array.isArray(packet.cameras)) return;
     lastTelemetryAt = Date.now();
+    setTelemetryStalled(false);
 
     if (!backendAdopted && !camerasEdited && packet.cameras.length > 0) {
       backendAdopted = true;
@@ -837,7 +853,7 @@
 
     state.cameras.forEach(function (cam) {
       var present = packet.cameras.some(function (item) { return item.id === cam.id; });
-      if (!present) updateCameraStatusFromTelemetry(cam, false);
+      if (!present) markCameraMissing(cam);
     });
 
     var active = null;
@@ -897,7 +913,9 @@
         restored.kind = "network";
         restored.preset = "custom";
       }
-      restored.status = cam.online ? "CONNECTED" : "IDLE";
+      restored.status = cam.online ? "CONNECTED" : "CONNECTING";
+      restored.connectAt = Date.now();
+      restored.connectionError = (cam.connection && cam.connection.error) || "";
       return restored;
     });
     if (state.cameras.length === 0) {
@@ -909,6 +927,9 @@
     if (!exists) state.activeId = state.cameras[0].id;
     renderChannels();
     renderViewports();
+    cameras.forEach(function (cam) {
+      updateCameraStatusFromTelemetry(cam, true);
+    });
     savePersisted();
   }
 
@@ -916,16 +937,21 @@
     var refs = viewRefs[cam.id];
     if (!refs) return;
     var level = normalizeLevel(cam.risk_level);
+    var isUnknown = String(cam.risk_level || "").toUpperCase() === "UNKNOWN";
     var color = riskColor(level);
 
-    refs.badge.textContent = cam.online ? level : "OFFLINE";
+    refs.badge.textContent = !cam.online ? "OFFLINE" : isUnknown ? "MODEL LOADING" : level;
     refs.badge.style.color = cam.online ? color : "#64748b";
     refs.badge.style.borderColor = cam.online ? color : "rgba(100, 116, 139, 0.35)";
     refs.badge.style.background = cam.online ? "rgba(255, 255, 255, 0.04)" : "rgba(100, 116, 139, 0.15)";
 
     refs.title.textContent = cam.label || cam.id;
-    refs.people.textContent = "People: " + Math.max(0, Math.round(toNumber(cam.people_now, 0)));
-    refs.score.textContent = "Score " + toNumber(cam.risk_score, 0).toFixed(2);
+    refs.people.textContent = isUnknown
+      ? "People: \u2014"
+      : "People: " + Math.max(0, Math.round(toNumber(cam.people_now, 0)));
+    refs.score.textContent = isUnknown
+      ? "Score \u2014"
+      : "Score " + toNumber(cam.risk_score, 0).toFixed(2);
 
     var wasOnline = refs.online === true;
     refs.online = !!cam.online;
@@ -1242,18 +1268,23 @@
   /* Camera status                                                      */
   /* ------------------------------------------------------------------ */
   function statusLabel(status) {
+    if (status === "LOADING MODEL") return "\u25cf LOADING MODEL";
     if (status === "CONNECTING") return "\u25cf CONNECTING";
     if (status === "CONNECTED") return "\u25cf CONNECTED";
     if (status === "FAILED") return "\u25cf FAILED";
     return "\u25cf IDLE";
   }
 
-  function setCameraStatus(cam, status) {
+  function setCameraStatus(cam, status, detail) {
     cam.status = status;
     var refs = channelRefs[cam.id];
     if (!refs || !refs.statusChip) return;
-    refs.statusChip.textContent = statusLabel(status);
-    refs.statusChip.className = "status-chip " + status.toLowerCase();
+    var label = statusLabel(status);
+    if (detail) label += " \u00b7 " + detail;
+    refs.statusChip.textContent = label;
+    var klass = status.toLowerCase().replace(/\s+/g, "-");
+    if (status === "LOADING MODEL") klass = "loading";
+    refs.statusChip.className = "status-chip " + klass;
   }
 
   function markCamerasConnecting() {
@@ -1265,23 +1296,50 @@
     });
   }
 
+  /* STEP 3: drive the chip from backend telemetry connection.state + elapsed time. */
   function updateCameraStatusFromTelemetry(telemetry, present) {
     var cam = cameraById(telemetry.id);
     if (!cam) return;
-    if (telemetry.online) {
-      if (cam.status !== "CONNECTED") {
-        setCameraStatus(cam, "CONNECTED");
+    var conn = telemetry.connection || {};
+    var state = String(conn.state || "").toLowerCase();
+    var elapsedMs = toNumber(conn.elapsed_ms, 0);
+    var detail = elapsedMs > 0 ? Math.max(0, Math.round(elapsedMs / 1000)) + "s" : "";
+
+    if (state === "connected" || (state === "" && telemetry.online)) {
+      cam.connectionError = "";
+      setCameraStatus(cam, "CONNECTED", detail);
+      if (cam.error) {
         cam.error = "";
         updateCardRefs(cam);
       }
       return;
     }
-    if (!present) {
-      if (cam.status === "CONNECTING" && Date.now() - cam.connectAt > CONNECT_TIMEOUT_MS) {
-        setCameraStatus(cam, "FAILED");
-        cam.error = "Camera was not registered by the backend. Check the URL and try again.";
+    cam.connectionError = conn.error || "";
+    if (state === "loading_model") {
+      setCameraStatus(cam, "LOADING MODEL", detail);
+      if (telemetry.model_error) {
+        cam.error = String(telemetry.model_error);
         updateCardRefs(cam);
       }
+      return;
+    }
+    if (state === "failed") {
+      setCameraStatus(cam, "FAILED", detail);
+      cam.error = conn.error || "Camera could not be opened.";
+      updateCardRefs(cam);
+      return;
+    }
+    if (state === "connecting") {
+      setCameraStatus(cam, "CONNECTING", detail);
+      if (conn.error) {
+        cam.error = String(conn.error);
+        updateCardRefs(cam);
+      }
+      return;
+    }
+    /* No connection object (older backend): keep the conservative timeout fallback. */
+    if (!present) {
+      markCameraMissing(cam);
       return;
     }
     if (cam.status === "CONNECTING" && Date.now() - cam.connectAt > CONNECT_TIMEOUT_MS) {
@@ -1289,6 +1347,53 @@
       cam.error = "No frames received. Check the IP, port, path, or that the phone is on the same Wi-Fi.";
       updateCardRefs(cam);
     }
+  }
+
+  function markCameraMissing(cam) {
+    if (cam.status === "CONNECTING" && Date.now() - cam.connectAt > Math.max(CONNECT_TIMEOUT_MS, 12000)) {
+      setCameraStatus(cam, "FAILED");
+      cam.error = "Camera was not registered by the backend. Check the URL and try again.";
+      updateCardRefs(cam);
+    }
+  }
+
+  /* STEP 3: Test connection -> backend test_source -> test_result. */
+  function testConnection(cam, refs) {
+    var error = validateCamera(cam);
+    if (error) {
+      cam.error = error;
+      updateCardRefs(cam);
+      return;
+    }
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      if (refs && refs.testResult) {
+        refs.testResult.textContent = "FAILED \u00b7 backend WebSocket is offline";
+        refs.testResult.className = "channel-test-result fail";
+      }
+      return;
+    }
+    var source = buildSource(cam);
+    if (refs && refs.testResult) {
+      refs.testResult.textContent = "Testing\u2026";
+      refs.testResult.className = "channel-test-result";
+    }
+    socket.send(JSON.stringify({ type: "test_source", id: cam.id, source: source }));
+  }
+
+  function showTestResult(packet) {
+    var camId = String(packet.id || "");
+    var refs = channelRefs[camId];
+    if (!refs || !refs.testResult) return;
+    var ok = packet.ok === true;
+    if (ok) {
+      refs.testResult.textContent =
+        "OK \u00b7 " + toInt(packet.width, 0) + "x" + toInt(packet.height, 0) +
+        " \u00b7 " + toNumber(packet.fps, 0).toFixed(1) + "fps \u00b7 " +
+        Math.round(toNumber(packet.elapsed_ms, 0)) + "ms";
+    } else {
+      refs.testResult.textContent = "FAILED \u00b7 " + (packet.error || "unknown error");
+    }
+    refs.testResult.className = "channel-test-result " + (ok ? "ok" : "fail");
   }
 
   /* ------------------------------------------------------------------ */
@@ -1569,6 +1674,17 @@
     connectBtn.textContent = "CONNECT / APPLY";
     controls.appendChild(connectBtn);
 
+    var testBtn = document.createElement("button");
+    testBtn.type = "button";
+    testBtn.className = "test-btn";
+    testBtn.textContent = "TEST CONNECTION";
+    controls.appendChild(testBtn);
+
+    var testResult = document.createElement("div");
+    testResult.className = "channel-test-result";
+    testResult.setAttribute("aria-live", "polite");
+    controls.appendChild(testResult);
+
     row.appendChild(head);
     row.appendChild(controls);
 
@@ -1589,7 +1705,9 @@
       urlPreview: urlPreview,
       hint: hint,
       error: error,
-      connectBtn: connectBtn
+      connectBtn: connectBtn,
+      testBtn: testBtn,
+      testResult: testResult
     };
     channelRefs[cam.id] = refs;
 
@@ -1704,6 +1822,10 @@
 
     connectBtn.addEventListener("click", function () {
       commitCamera(cam, true);
+    });
+
+    testBtn.addEventListener("click", function () {
+      testConnection(cam, refs);
     });
 
     syncCardFields(cam, refs);
