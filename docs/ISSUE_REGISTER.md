@@ -7,18 +7,18 @@
 
 | ID | Sev | Area | Issue (file:line evidence) | Phase | Status |
 |----|-----|------|---------------------------|-------|--------|
-| I-A1 | S2 | concurrency | `apply_cameras` calls `pipeline.stop()` (joins thread up to 5s) **while holding `state.lock`** → broadcast loop stalls up to 5s/camera during camera removal (`alert_vision.py:1334-1338`) | A | OPEN |
-| I-A2 | S2 | concurrency | `CameraPipeline.stop()` writes `self.online=False` and releases `cap` from the *caller* thread while worker may be mid-`cap.read()`; `online`/`frame_time` shared with no lock (`alert_vision.py:377-388`) | A | OPEN |
-| I-A3 | S2 | concurrency | `read_frame` grabs `cap` under lock but calls `cap.read()` **outside** the lock (`alert_vision.py:644-661`) → concurrent `release()` from `stop()`/hot-swap can free the handle mid-read | A | OPEN |
-| I-A4 | S3 | concurrency | `_conn_state/_conn_error/_conn_started/_resolved_source` mutated by worker, read by broadcast loop with no lock → torn `connection` payload (state from one attempt, error from another) | A | OPEN |
-| I-A5 | S1 | WS reliability | **Alerts share the per-client telemetry queue; `broadcast()` drops messages when full — including `type:"alert"`** → emergency alert can be lost behind slow telemetry drain (`alert_vision.py:1475-1489`) | A | OPEN |
-| I-A6 | S1 | WS reliability | `acknowledge_alert()` pops the alert as soon as it is *queued* for ≥1 client; queue-acceptance is indistinguishable from browser receipt, and with 0 clients the alert is never acked but also never re-signalled distinctly | A | OPEN |
-| I-A7 | S2 | logging | `_handle_connection` ends in bare `except Exception: pass` (`alert_vision.py:1794-1795`) — swallows handler faults wholesale | A | OPEN |
-| I-A8 | S3 | logging | `_log_writer` retry loop re-queues a failing row forever every 0.5s with no cap and never sets `log_error` → silent infinite retry, UI never shows log failure | A | OPEN |
-| I-A9 | S4 | WS | `send_raw`/`send_history` use `put_nowait` without full-check → `QueueFull` raised into handler (caught by I-A7's blanket except, killing the client silently) | A | OPEN |
-| I-A10 | S4 | config | `update_config` stride-change log compares new value against already-updated `self.stride` → message never fires for actual changes (`alert_vision.py:1249-1251`) | A | OPEN |
-| I-A11 | S2 | camera | `_run` offline path publishes `_offline_packet()` **before** `_try_reconnect()` sets `connection.state` for that attempt → one tick of stale `failed`/old error; also `time.sleep(0.1)` fixed regardless of backoff | A | OPEN |
-| I-A12 | S3 | camera | `_apply_pending_source` failure leaves `_last_open_error` from a *previous* source (only cleared on success) → wrong reason shown after hot-swap to a new bad source | A | OPEN |
+| I-A1 | S2 | concurrency | `apply_cameras` calls `pipeline.stop()` (joins thread up to 5s) **while holding `state.lock`** → broadcast loop stalls up to 5s/camera during camera removal (`alert_vision.py:1334-1338`) | A | FIXED |
+| I-A2 | S2 | concurrency | `CameraPipeline.stop()` writes `self.online=False` and releases `cap` from the *caller* thread while worker may be mid-`cap.read()`; `online`/`frame_time` shared with no lock (`alert_vision.py:377-388`) | A | FIXED |
+| I-A3 | S2 | concurrency | `read_frame` grabs `cap` under lock but calls `cap.read()` **outside** the lock (`alert_vision.py:644-661`) → concurrent `release()` from `stop()`/hot-swap can free the handle mid-read | A | FIXED |
+| I-A4 | S3 | concurrency | `_conn_state/_conn_error/_conn_started/_resolved_source` mutated by worker, read by broadcast loop with no lock → torn `connection` payload (state from one attempt, error from another) | A | FIXED |
+| I-A5 | S1 | WS reliability | **Alerts share the per-client telemetry queue; `broadcast()` drops messages when full — including `type:"alert"`** → emergency alert can be lost behind slow telemetry drain (`alert_vision.py:1475-1489`) | A | FIXED |
+| I-A6 | S1 | WS reliability | `acknowledge_alert()` pops the alert as soon as it is *queued* for ≥1 client; queue-acceptance is indistinguishable from browser receipt, and with 0 clients the alert is never acked but also never re-signalled distinctly | A | FIXED |
+| I-A7 | S2 | logging | `_handle_connection` ends in bare `except Exception: pass` (`alert_vision.py:1794-1795`) — swallows handler faults wholesale | A | FIXED |
+| I-A8 | S3 | logging | `_log_writer` retry loop re-queues a failing row forever every 0.5s with no cap and never sets `log_error` → silent infinite retry, UI never shows log failure | A | FIXED |
+| I-A9 | S4 | WS | `send_raw`/`send_history` use `put_nowait` without full-check → `QueueFull` raised into handler (caught by I-A7's blanket except, killing the client silently) | A | FIXED |
+| I-A10 | S4 | config | `update_config` stride-change log compares new value against already-updated `self.stride` → message never fires for actual changes (`alert_vision.py:1249-1251`) | A | FIXED |
+| I-A11 | S2 | camera | `_run` offline path publishes `_offline_packet()` **before** `_try_reconnect()` sets `connection.state` for that attempt → one tick of stale `failed`/old error; also `time.sleep(0.1)` fixed regardless of backoff | A | FIXED |
+| I-A12 | S3 | camera | `_apply_pending_source` failure leaves `_last_open_error` from a *previous* source (only cleared on success) → wrong reason shown after hot-swap to a new bad source | A | FIXED |
 | I-B1 | S2 | CV | `LiveAnalyzer.add` `rate_of_change` term = raw per-frame delta of normalized density → **stride/FPS dependent**: same real-world crowd rise scores ~stride× higher at stride 10 (`analytics.py:160-161,178`) | B | OPEN |
 | I-B2 | S2 | CV | EMA (`LEVELING_ALPHA=0.25` per sample) applied per *frame* not per *second* → smoothing strength varies with FPS/stride (`analytics.py:165,190`) | B | OPEN |
 | I-B3 | S3 | CV | `compute_flow_signal` `dt` accepted but explicitly unused; `velocity` = mean px/frame with no dt normalization → not comparable across FPS | B | OPEN |

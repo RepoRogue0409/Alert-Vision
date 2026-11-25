@@ -137,6 +137,14 @@ DEFAULT_MIN_PEOPLE = 3
 ESCALATE_HOLD_SECONDS = 1.5
 DEESCALATE_HOLD_SECONDS = 4.0
 ALERT_COOLDOWN_SECONDS = 30.0
+# I-A6: after an alert packet has been queued to at least one client, how long
+# to wait for an explicit browser receipt (alert_ack) before popping it anyway.
+# Distinguishes queue acceptance (backend) from browser receipt (frontend).
+ALERT_RECEIPT_GRACE_SECONDS = 10.0
+# No WS client ever accepted the alert -> release it after this long; the
+# alert_history replay still delivers it to the next client that connects.
+ALERT_NO_CLIENT_ABANDON_SECONDS = 60.0
+MAX_CSV_WRITE_RETRIES = 3
 
 RECONNECT_INTERVAL = 2.0
 RECONNECT_MAX_DELAY = 30.0
@@ -331,12 +339,19 @@ class CameraPipeline:
         self.prev_flow_time = None
         self.latest_frame = None
         self.latest_jpeg = None
+        # I-A2/I-A3: `online`/`frame_time` are written by the worker and read
+        # by health/snapshot/MJPEG threads -> guard with capture_lock.  The
+        # worker never holds capture_lock while calling into shared state that
+        # itself takes capture_lock, so no lock ordering hazard exists.
         self.online = False
         self.last_reconnect_attempt = 0.0
         self.reconnect_attempts = 0
         self.frame_time = 0.0
 
         # STEP 2: connection diagnostics surfaced in every telemetry packet.
+        # I-A4: mutated by the worker, read by the broadcast loop -> own lock
+        # so a packet never mixes state from one attempt with another's error.
+        self._conn_lock = threading.Lock()
         self._conn_state = "loading_model"
         self._conn_error = None
         self._conn_started = time.monotonic()
@@ -376,16 +391,29 @@ class CameraPipeline:
 
     def stop(self) -> None:
         self.stop_event.set()
+        stopped = True
         if self.thread is not None:
             self.thread.join(timeout=5.0)
-            self.thread = None
-        with self.capture_lock:
-            self._source_dirty = False
-            if self.cap is not None:
-                with contextlib.suppress(Exception):
-                    self.cap.release()
-                self.cap = None
-        self.online = False
+            # I-A2: if the worker is still alive (stuck in a slow read) do NOT
+            # touch the capture handle from this thread - releasing it under a
+            # concurrent cap.read() is undefined behaviour. The daemon thread
+            # dies with the process; the handle is reclaimed then.
+            stopped = not self.thread.is_alive()
+            if stopped:
+                self.thread = None
+        if stopped:
+            with self.capture_lock:
+                self._source_dirty = False
+                if self.cap is not None:
+                    with contextlib.suppress(Exception):
+                        self.cap.release()
+                    self.cap = None
+                self.online = False
+        else:
+            print(
+                f":: [Alert Vision] {self.id} worker did not stop within 5s; "
+                "capture handle left to the worker thread"
+            )
 
     def set_source(self, source) -> None:
         """Queue a hot-swap; only the reader thread touches the handle."""
@@ -473,15 +501,15 @@ class CameraPipeline:
                     return None
             cap = self._open_capture(candidate, timeout_ms=4000 if index == 0 else 2000)
             if cap is not None:
-                self._last_open_error = None
-                if candidate != source:
+                with self._conn_lock:
+                    # I-A12: every fresh attempt clears the previous source's error.
+                    self._last_open_error = None
                     self._resolved_source = candidate
+                if candidate != source:
                     print(
                         f":: [Alert Vision] {self.id} alternate stream path worked -> "
                         f"{_source_display(candidate)}"
                     )
-                else:
-                    self._resolved_source = source
                 return cap
             if index == 0 and len(candidates) > 1:
                 # Only try alternate paths when the host itself answers. If it is
@@ -489,39 +517,50 @@ class CameraPipeline:
                 # delay the readable FAILED state.
                 reason = self._source_error_hint(source, timeout=0.6)
                 if reason is not None:
-                    self._last_open_error = reason
-                    self._resolved_source = source
+                    with self._conn_lock:
+                        self._last_open_error = reason
+                        self._resolved_source = source
                     return None
-        self._resolved_source = source
+        with self._conn_lock:
+            self._resolved_source = source
         return None
 
     def _set_connection(self, state: str, error=None) -> None:
         now = time.monotonic()
-        if state != self._conn_state:
-            self._conn_state = state
-            # Keep the attempt clock running into "failed" so elapsed_ms reports
-            # how long the failed connect attempt took.
-            if state in ("loading_model", "connecting", "connected"):
-                self._conn_started = now
-        if state in ("connecting", "connected", "loading_model"):
-            # A fresh attempt starts clean; stale errors belong to the last failure.
-            self._conn_error = None
-        if error:
-            self._conn_error = str(error)
+        with self._conn_lock:
+            if state != self._conn_state:
+                self._conn_state = state
+                # Keep the attempt clock running into "failed" so elapsed_ms reports
+                # how long the failed connect attempt took.
+                if state in ("loading_model", "connecting", "connected"):
+                    self._conn_started = now
+            if state in ("connecting", "connected", "loading_model"):
+                # A fresh attempt starts clean; stale errors belong to the last failure.
+                self._conn_error = None
+            if error:
+                self._conn_error = str(error)
 
     def _connection_payload(self) -> dict:
-        elapsed_ms = max(0.0, (time.monotonic() - self._conn_started) * 1000.0)
+        # I-A4: one consistent snapshot of {state, error, elapsed, url}.
+        with self._conn_lock:
+            state = str(self._conn_state)
+            error = self._conn_error
+            started = self._conn_started
+            resolved = self._resolved_source
+        elapsed_ms = max(0.0, (time.monotonic() - started) * 1000.0)
         return {
-            "state": str(self._conn_state),
-            "error": self._conn_error,
+            "state": state,
+            "error": error,
             "elapsed_ms": float(round(elapsed_ms, 1)),
-            "resolved_url_masked": _source_display(self._resolved_source),
+            "resolved_url_masked": _source_display(resolved),
         }
 
     def _connection_error_hint(self) -> str:
         """Best-effort readable reason for a failed stream open."""
-        if self._last_open_error:
-            return self._last_open_error
+        with self._conn_lock:
+            last_error = self._last_open_error
+        if last_error:
+            return last_error
         return self._source_error_hint(self.source) or (
             "stream open failed: wrong path, camera busy (one-client limit), "
             "or unsupported stream"
@@ -563,8 +602,12 @@ class CameraPipeline:
             source = self._pending_source
             self._pending_source = None
         # Open outside the lock so a slow stream does not block the whole channel.
-        self._conn_started = time.monotonic()
+        with self._conn_lock:
+            self._conn_started = time.monotonic()
         self._set_connection("connecting", None)
+        # I-A12: a new source invalidates the previous attempt's error reason.
+        with self._conn_lock:
+            self._last_open_error = None
         new_cap = self._open_with_alternates(source)
         with self.capture_lock:
             self.source = source
@@ -617,7 +660,8 @@ class CameraPipeline:
                     self.cap.release()
                 self.cap = None
         # Open OUTSIDE the capture lock so a slow stream does not block the whole channel.
-        self._conn_started = time.monotonic()
+        with self._conn_lock:
+            self._conn_started = time.monotonic()
         self._set_connection("connecting", None)
         new_cap = self._open_with_alternates(self.source)
         with self.capture_lock:
@@ -642,22 +686,28 @@ class CameraPipeline:
         return float(min(RECONNECT_INTERVAL * (2.0 ** min(self.reconnect_attempts, 5)), RECONNECT_MAX_DELAY))
 
     def read_frame(self):
+        # The handle is only ever released by THIS worker thread (stop() waits
+        # for the thread to exit first), so reading outside the lock cannot race
+        # a concurrent release (I-A3). Flag writes take the lock because health
+        # and snapshot readers observe them.
         with self.capture_lock:
             cap = self.cap
         if cap is None or not cap.isOpened():
-            self.online = False
+            with self.capture_lock:
+                self.online = False
             return None
         grabbed, frame = cap.read()
         if not grabbed or frame is None:
-            self.online = False
             with self.capture_lock:
+                self.online = False
                 if self.cap is cap:
                     with contextlib.suppress(Exception):
                         cap.release()
                     self.cap = None
             return None
-        self.online = True
-        self.frame_time = time.monotonic()
+        with self.capture_lock:
+            self.online = True
+            self.frame_time = time.monotonic()
         return frame
 
     # -- worker loop ---------------------------------------------------------
@@ -671,7 +721,9 @@ class CameraPipeline:
                 self.model = loaded
                 self.model_error = None
                 print(f":: [Alert Vision] {self.id} model loaded -> {model_path}")
-                if self._conn_state == "loading_model":
+                with self._conn_lock:
+                    still_loading = self._conn_state == "loading_model"
+                if still_loading:
                     self._set_connection("connecting", None)
                 return
             except Exception as error:
@@ -697,8 +749,11 @@ class CameraPipeline:
                 with self.frame_lock:
                     self.latest_frame = None
                     self.latest_jpeg = None
-                self._publish(self._offline_packet())
+                # I-A11: attempt the reconnect FIRST so the offline packet we
+                # publish reflects this tick's real connection state/error
+                # instead of the previous attempt's leftovers.
                 self._try_reconnect()
+                self._publish(self._offline_packet())
                 time.sleep(0.1)
                 continue
 
@@ -921,6 +976,12 @@ class CameraPipeline:
                         "risk_level": self.current_risk,
                         "confidence": avg_confidence,
                         "timestamp": time.time() * 1000.0,
+                        # I-A6: delivery lifecycle. queued -> (dispatched to N
+                        # client queues) -> acked by browser / grace expired.
+                        "_queued_at": time.monotonic(),
+                        "_dispatched_at": None,
+                        "_accepted": 0,
+                        "_acked": False,
                     }
                     self.alert_state = self.current_risk
                     self.cooldown_until = time.monotonic() + ALERT_COOLDOWN_SECONDS
@@ -1067,16 +1128,78 @@ class CameraPipeline:
             "alert": False,
             "action": "NONE",
             "camera_online": False,
-            "log_error": bool(self.log_error),
+            "log_error": bool(self.state.log_error) if self.state is not None else False,
             "model_error": self.model_error,
             "connection": self._connection_payload(),
         }
 
-    def acknowledge_alert(self) -> None:
-        """Mark the front pending alert as delivered (consumed)."""
+    def acknowledge_alert(self, alert_id=None) -> bool:
+        """Pop the front alert as BROWSER-RECEIPTED (explicit alert_ack).
+
+        Returns True when an alert was consumed.  ``alert_id`` (when given)
+        must match the front alert - stale acks never eat a newer alert.
+        """
         with self.frame_lock:
-            if self.alert_queue:
-                self.alert_queue.popleft()
+            if not self.alert_queue:
+                return False
+            event = self.alert_queue[0]
+            if alert_id is not None and int(event.get("alert_id") or 0) != int(alert_id):
+                return False
+            event["_acked"] = True
+            self.alert_queue.popleft()
+        return True
+
+    def front_alert_needs_dispatch(self) -> bool:
+        """True when the front alert has not yet been queued to any client."""
+        with self.frame_lock:
+            if not self.alert_queue:
+                return False
+            return self.alert_queue[0].get("_dispatched_at") is None
+
+    def mark_alert_dispatched(self, accepted: int) -> None:
+        """Record QUEUE ACCEPTANCE: the alert packet entered N client queues."""
+        with self.frame_lock:
+            if not self.alert_queue:
+                return
+            event = self.alert_queue[0]
+            if event.get("_dispatched_at") is None:
+                event["_dispatched_at"] = time.monotonic()
+                event["_accepted"] = max(0, int(accepted))
+
+    def sweep_alert_queue(self) -> None:
+        """Release front alerts whose receipt grace expired (I-A6).
+
+        * browser acked            -> already popped by acknowledge_alert()
+        * queued to clients, no
+          browser receipt in 10s   -> pop (queue acceptance only)
+        * never dispatched (no
+          clients) for 60s         -> pop; history replay still covers it
+        """
+        now = time.monotonic()
+        with self.frame_lock:
+            while self.alert_queue:
+                event = self.alert_queue[0]
+                if event.get("_acked"):
+                    self.alert_queue.popleft()
+                    continue
+                dispatched = event.get("_dispatched_at")
+                if dispatched is not None and now - dispatched >= ALERT_RECEIPT_GRACE_SECONDS:
+                    print(
+                        f":: [Alert Vision] {self.id} alert {event.get('alert_id')} "
+                        f"queue-accepted (clients={event.get('_accepted')}) but no browser "
+                        f"receipt in {ALERT_RECEIPT_GRACE_SECONDS:.0f}s -> releasing"
+                    )
+                    self.alert_queue.popleft()
+                    continue
+                if dispatched is None and now - float(event.get("_queued_at") or now) >= ALERT_NO_CLIENT_ABANDON_SECONDS:
+                    print(
+                        f":: [Alert Vision] {self.id} alert {event.get('alert_id')} "
+                        "never dispatchable (no WS clients) -> releasing; "
+                        "history replay still covers it"
+                    )
+                    self.alert_queue.popleft()
+                    continue
+                break
 
     def snapshot(self) -> dict:
         with self.frame_lock:
@@ -1103,7 +1226,7 @@ class CameraPipeline:
         packet["online"] = bool(self.online)
         packet["camera_online"] = bool(self.online)
         packet["last_frame_age_ms"] = float(frame_age_ms)
-        packet["log_error"] = bool(self.log_error)
+        packet["log_error"] = bool(self.state.log_error) if self.state is not None else False
         packet["model_error"] = self.model_error
         packet["connection"] = self._connection_payload()
         if not self.online:
@@ -1140,19 +1263,33 @@ class SharedSystemState:
     # -- logging -------------------------------------------------------------
     def _log_writer(self) -> None:
         while True:
-            row = self._retry_queue.get()
-            if row is None:
+            item = self._retry_queue.get()
+            if item is None:
                 break
+            # I-A8: rows carry a retry counter so a persistently failing write
+            # (disk full, permissions) gives up after MAX_CSV_WRITE_RETRIES
+            # instead of spinning forever, and surfaces log_error to the UI.
+            if isinstance(item, tuple):
+                row, retries = item
+            else:
+                row, retries = item, 0
             try:
                 if os.path.exists(self.log_file) and os.path.getsize(self.log_file) > LOG_MAX_BYTES:
                     with contextlib.suppress(Exception):
                         os.replace(self.log_file, self.log_file + ".1")
                 with open(self.log_file, "a", newline="") as handle:
                     csv.writer(handle).writerow(row)
-            except Exception:
-                # retry-safe: never let the writer thread die on a transient error
+                self.log_error = False
+            except Exception as error:
+                if retries >= MAX_CSV_WRITE_RETRIES:
+                    self.log_error = True
+                    print(
+                        f":: [Alert Vision] CSV write failed {retries + 1}x, row dropped "
+                        f"({type(error).__name__}): {error}"
+                    )
+                    continue
                 with contextlib.suppress(Exception):
-                    self._retry_queue.put(row)
+                    self._retry_queue.put((row, retries + 1))
                 time.sleep(0.5)
         return
 
@@ -1243,12 +1380,16 @@ class SharedSystemState:
         validated = self.validate_config(payload)
         stride_changed = None
         with self.lock:
+            old_stride = int(self.stride)
             self.weights = dict(validated["weights"])
             self.alert_threshold = float(validated["alert_threshold"])
             self.risk_thresholds = dict(validated["risk_thresholds"])
             self.stride = int(validated["stride"])
-            if payload.get("stride") is not None and int(payload.get("stride")) != self.stride:
-                stride_changed = self.stride
+            # I-A10: compare the NEW stride against the OLD one (captured
+            # before assignment) - the previous code compared after writing,
+            # so real changes never logged.
+            if payload.get("stride") is not None and int(self.stride) != old_stride:
+                stride_changed = int(self.stride)
         if stride_changed is not None:
             print(f":: [Alert Vision] Inference stride -> {stride_changed}")
 
@@ -1293,6 +1434,7 @@ class SharedSystemState:
         if not normalized:
             return
 
+        removed = []
         with self.lock:
             existing = dict(self.cameras)
             wanted: dict[str, CameraPipeline] = {}
@@ -1331,11 +1473,19 @@ class SharedSystemState:
                     if normalize_source(pipeline.source) != normalize_source(spec["source"]):
                         pipeline.set_source(spec["source"])
                 wanted[spec["id"]] = pipeline
-            for cam_id, pipeline in existing.items():
-                if cam_id not in wanted:
-                    pipeline.stop()
-                    print(f":: [Alert Vision] {cam_id} channel removed")
+            # I-A1: collect removals under the lock but STOP them OUTSIDE it -
+            # stop() joins the worker for up to 5s, which would otherwise stall
+            # every telemetry snapshot waiting on state.lock.
+            removed = [
+                (cam_id, pipeline)
+                for cam_id, pipeline in existing.items()
+                if cam_id not in wanted
+            ]
             self.cameras = wanted
+
+        for cam_id, pipeline in removed:
+            pipeline.stop()
+            print(f":: [Alert Vision] {cam_id} channel removed")
 
         for pipeline in new_pipelines:
             pipeline.start()
@@ -1422,6 +1572,9 @@ class SharedSystemState:
 class _ClientSession:
     def __init__(self, connection) -> None:
         self.connection = connection
+        # I-A5: alerts ride a separate, priority queue so a slow telemetry
+        # drain can never block or drop an emergency alert.
+        self.alert_queue: asyncio.Queue = asyncio.Queue(maxsize=16)
         self.incoming_queue: asyncio.Queue = asyncio.Queue(maxsize=64)
         self.task: asyncio.Task = None
 
@@ -1451,52 +1604,96 @@ class WebSocketBroadcaster:
             session = self.clients.pop(connection, None)
         if session is not None and session.task is not None:
             session.task.cancel()
-            with contextlib.suppress(Exception):
-                await session.task
+            # gather(return_exceptions=True) reaps the cancelled task without
+            # letting CancelledError (a BaseException) escape into the caller.
+            await asyncio.gather(session.task, return_exceptions=True)
 
     def active_count(self) -> int:
         return len(self.clients)
 
     async def send_history(self, connection, alerts) -> None:
         message = json.dumps({"type": "history", "alerts": list(alerts)})
-        async with self._lock:
-            session = self.clients.get(connection)
-        if session is None:
-            return
-        session.incoming_queue.put_nowait(message)
+        await self.send_raw(connection, message)
 
     async def send_raw(self, connection, message: str) -> None:
         async with self._lock:
             session = self.clients.get(connection)
         if session is None:
             return
-        session.incoming_queue.put_nowait(message)
+        # I-A9: never raise QueueFull into the handler - drop instead.
+        if session.incoming_queue.full():
+            print(":: [Alert Vision] dropping non-alert message for slow client")
+            return
+        try:
+            session.incoming_queue.put_nowait(message)
+        except asyncio.QueueFull:
+            print(":: [Alert Vision] dropping non-alert message for slow client")
 
-    async def broadcast(self, packet: dict) -> None:
+    async def broadcast(self, packet: dict) -> int:
+        """Fan out one packet; returns how many client queues ACCEPTED it.
+
+        Queue acceptance is a backend-side fact (the message entered the
+        client's asyncio queue) - it is NOT browser receipt (I-A6).
+        """
         async with self._lock:
             sessions = tuple(self.clients.values())
         if not sessions:
-            return
+            return 0
         try:
             message = json.dumps(_sanitize(packet), allow_nan=False)
         except Exception:
             # never let a non-serializable packet kill the fan-out
-            return
+            return 0
+        # I-A5: emergency alerts go to the priority queue; telemetry to the
+        # regular queue. An alert is only dropped if the *alert* queue itself
+        # is full (16 deep), never because telemetry backed up.
+        is_alert = str(packet.get("type") or "") == "alert"
+        accepted = 0
         for session in sessions:
-            if session.incoming_queue.full():
+            queue = session.alert_queue if is_alert else session.incoming_queue
+            if queue.full():
                 # drop slow-client traffic instead of blocking the others
                 continue
-            session.incoming_queue.put_nowait(message)
+            try:
+                queue.put_nowait(message)
+                accepted += 1
+            except asyncio.QueueFull:
+                continue
+        return accepted
 
     async def _session_loop(self, session: _ClientSession) -> None:
         try:
             while True:
+                message = None
+                # I-A5: drain alerts first - emergency traffic outranks telemetry.
                 try:
-                    message = await asyncio.wait_for(session.incoming_queue.get(), timeout=SEND_TIMEOUT_SEC)
-                except asyncio.TimeoutError:
-                    continue
-                except asyncio.CancelledError:
-                    raise
+                    message = session.alert_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                if message is None:
+                    try:
+                        message = await asyncio.wait_for(
+                            session.incoming_queue.get(), timeout=SEND_TIMEOUT_SEC
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+                    except asyncio.CancelledError:
+                        raise
+                    # An alert may have arrived while we waited for telemetry.
+                    try:
+                        priority = session.alert_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        priority = None
+                    if priority is not None:
+                        # send the alert first, requeue the telemetry behind it
+                        if session.incoming_queue.full():
+                            pass  # telemetry is droppable; alert is not
+                        else:
+                            try:
+                                session.incoming_queue.put_nowait(message)
+                            except asyncio.QueueFull:
+                                pass
+                        message = priority
                 await asyncio.wait_for(self._send(session.connection, message), timeout=SEND_TIMEOUT_SEC)
         except Exception:
             # B8: a timed-out send means the client is dead -> close it, don't leak the socket.
@@ -1722,6 +1919,22 @@ class AlertVisionBackend:
                     if not isinstance(payload, dict):
                         continue
                     message_type = str(payload.get("type") or "")
+                    if message_type == "alert_ack":
+                        # I-A6: explicit BROWSER RECEIPT of an alert.
+                        ack_id = payload.get("alert_id")
+                        try:
+                            ack_id = int(ack_id)
+                        except (TypeError, ValueError):
+                            ack_id = 0
+                        if ack_id > 0:
+                            for pipeline in self.state.camera_list():
+                                if pipeline.acknowledge_alert(ack_id):
+                                    print(
+                                        f":: [Alert Vision] alert {ack_id} browser-receipt "
+                                        f"confirmed by client ({pipeline.id})"
+                                    )
+                                    break
+                        continue
                     if message_type == "config":
                         loop = asyncio.get_running_loop()
                         try:
@@ -1791,8 +2004,13 @@ class AlertVisionBackend:
                                 )
                             ),
                         )
-        except Exception:
-            pass
+        except Exception as error:
+            # I-A7: log the fault instead of swallowing it wholesale; the
+            # connection is cleaned up in finally either way.
+            print(
+                f":: [Alert Vision] WS handler error "
+                f"({type(error).__name__}): {error}"
+            )
         finally:
             await self.broadcaster.unregister(connection)
 
@@ -1872,36 +2090,52 @@ class AlertVisionBackend:
         F1/A1: the full telemetry packet is broadcast to all connected clients every
         ``BROADCAST_INTERVAL`` even when no alert fired, so the dashboard always shows
         live state (risk, people, scores, source, etc.).
+
+        I-A5/I-A6: emergency alert packets ride the priority queue and are
+        dispatched exactly once per alert; ``broadcast()``'s return value is
+        recorded as QUEUE ACCEPTANCE (per-client queue depth), which is
+        explicitly not browser receipt - receipt arrives as an ``alert_ack``
+        message or expires after ``ALERT_RECEIPT_GRACE_SECONDS``.
         """
         packet = self.state.build_packet()
-        alerted_ids = set()
-        if packet.get("alert"):
-            for cam in packet.get("cameras") or []:
-                if isinstance(cam, dict) and bool(cam.get("alert")):
-                    alerted_ids.add(str(cam.get("id")))
 
         if self.broadcaster.active_count() > 0:
             await self.broadcaster.broadcast(packet)
 
         for cam in packet.get("cameras") or []:
-            if isinstance(cam, dict) and bool(cam.get("alert")):
-                await self.broadcaster.broadcast(
-                    {
-                        "type": "alert",
-                        "alert_id": int(cam.get("alert_id") or 0),
-                        "camera_id": str(cam.get("id") or ""),
-                        "camera_label": str(cam.get("label") or ""),
-                        "risk_level": str(cam.get("risk_level") or "HIGH"),
-                        "action": str(cam.get("action") or "ESCALATE"),
-                        "confidence": float(cam.get("confidence") or 0.0),
-                        "timestamp": float(cam.get("timestamp") or time.time() * 1000.0),
-                    }
+            if not (isinstance(cam, dict) and bool(cam.get("alert"))):
+                continue
+            pipeline = self.state.cameras.get(str(cam.get("id") or ""))
+            if pipeline is None or not pipeline.front_alert_needs_dispatch():
+                continue  # already dispatched (or released) - never re-send
+            accepted = await self.broadcaster.broadcast(
+                {
+                    "type": "alert",
+                    "alert_id": int(cam.get("alert_id") or 0),
+                    "camera_id": str(cam.get("id") or ""),
+                    "camera_label": str(cam.get("label") or ""),
+                    "risk_level": str(cam.get("risk_level") or "HIGH"),
+                    "action": str(cam.get("action") or "ESCALATE"),
+                    "confidence": float(cam.get("confidence") or 0.0),
+                    "timestamp": float(cam.get("timestamp") or time.time() * 1000.0),
+                }
+            )
+            pipeline.mark_alert_dispatched(accepted)
+            if accepted == 0:
+                print(
+                    f":: [Alert Vision] alert {cam.get('alert_id')} for "
+                    f"{cam.get('id')} queued: no WS clients (will replay via history)"
+                )
+            else:
+                print(
+                    f":: [Alert Vision] alert {cam.get('alert_id')} for "
+                    f"{cam.get('id')} queue-accepted by {accepted} client(s); "
+                    "awaiting alert_ack (browser receipt)"
                 )
 
-        if alerted_ids and self.broadcaster.active_count() > 0:
-            for cam_id, pipeline in list(self.state.cameras.items()):
-                if str(cam_id) in alerted_ids:
-                    pipeline.acknowledge_alert()
+        # Release alerts whose receipt grace expired (queue-accept only).
+        for pipeline in list(self.state.cameras.values()):
+            pipeline.sweep_alert_queue()
         return packet
 
 

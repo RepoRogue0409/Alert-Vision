@@ -807,6 +807,11 @@
     if (packet.type === "alert") {
       appendLedgerFromEvent(packet);
       showAlarm(packet);
+      /* I-A6: explicit BROWSER RECEIPT - the backend keeps the alert queued
+         (queue acceptance only) until this ack or the receipt grace expires. */
+      if (socket && socket.readyState === WebSocket.OPEN && packet.alert_id) {
+        socket.send(JSON.stringify({ type: "alert_ack", alert_id: packet.alert_id }));
+      }
       return;
     }
     if (packet.type === "config_ack") {
