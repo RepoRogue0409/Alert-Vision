@@ -5,6 +5,7 @@ bound to 127.0.0.1, and nothing else. Uses only the Python standard library so n
 extra dependencies are required.
 """
 
+import contextlib
 import os
 import posixpath
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,7 +27,12 @@ class WhitelistHandler(BaseHTTPRequestHandler):
         if not cleaned.startswith("/"):
             cleaned = "/" + cleaned
         candidate = os.path.normpath(os.path.join(ROOT, cleaned.lstrip("/")))
-        if not candidate.startswith(ROOT):
+        # I-D2: prefix string comparison would accept sibling directories such
+        # as ROOT + "evil". commonpath compares whole path components.
+        try:
+            if os.path.commonpath([ROOT, candidate]) != ROOT:
+                return None
+        except ValueError:
             return None
         if not os.path.isfile(candidate):
             return None
@@ -70,6 +76,15 @@ class WhitelistHandler(BaseHTTPRequestHandler):
 def main() -> None:
     server = ThreadingHTTPServer((HOST, PORT), WhitelistHandler)
     server.daemon_threads = True
+    # I-D1: let start.bat stop ONLY this server on shutdown instead of killing
+    # every python.exe on the machine.
+    pid_file = os.environ.get("ALERT_VISION_STATIC_PID_FILE") or ""
+    if pid_file:
+        try:
+            with open(pid_file, "w", encoding="utf-8") as handle:
+                handle.write(str(os.getpid()))
+        except OSError:
+            pid_file = ""
     print(f":: [Alert Vision] Static dashboard server on http://{HOST}:{PORT}/", flush=True)
     try:
         server.serve_forever()
@@ -77,6 +92,9 @@ def main() -> None:
         pass
     finally:
         server.server_close()
+        if pid_file:
+            with contextlib.suppress(OSError):
+                os.remove(pid_file)
 
 
 if __name__ == "__main__":

@@ -1928,9 +1928,11 @@ class AlertVisionBackend:
         configured = os.environ.get("ALERT_VISION_ALLOWED_ORIGINS") or ""
         allowed = {"http://localhost:8000", "http://127.0.0.1:8000"}
         for entry in configured.split(","):
-            entry = entry.strip()
-            if entry:
-                allowed.add(f"http://{entry}")
+            entry = entry.strip().rstrip("/")
+            if not entry:
+                continue
+            # I-D3: accept full scheme URLs; only bare host:port gets http://.
+            allowed.add(entry if "://" in entry else f"http://{entry}")
         return origin in allowed
 
     async def _handle_connection(self, connection, path=None) -> None:
@@ -1968,6 +1970,16 @@ class AlertVisionBackend:
                         window_start = now_mono
                     msg_count += 1
                     if msg_count > MAX_WS_MESSAGES_PER_SEC:
+                        # I-D5: never silently lose a config save. Tell the
+                        # client why the message was rejected.
+                        with contextlib.suppress(Exception):
+                            await self.broadcaster.send_raw(
+                                connection,
+                                json.dumps({
+                                    "type": "config_error",
+                                    "error": f"message rate limit exceeded ({MAX_WS_MESSAGES_PER_SEC}/s)",
+                                }),
+                            )
                         continue
                     try:
                         payload = json.loads(text)
