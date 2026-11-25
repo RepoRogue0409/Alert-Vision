@@ -1,103 +1,60 @@
-# Alert Vision — Change Log (Round 2 audit)
+# Alert Vision — Change Log
 
-> **Audit note**: The previous revision claimed fixes that were missing or broken. This
-> revision lists only what is verifiably implemented in code *and* covered by a passing test
-> (or a manual QA step) as of this round. Nothing here is marked DONE unless proven.
+> Honest state after the MASTER ENGINEERING audit. A status is DONE only when
+> there is a passing automated test or a recorded manual check. "PARTIAL" and
+> "NOT VERIFIED" are kept where measurement/browser QA is still required.
+> Historical Round-2 PARTIAL rows are superseded by the Phase A–G rows below;
+> the old table was stale in both directions (it under- and over-reported fixes).
 
-## Phase A — Showstoppers
+## Final audit phases (commits `5e84626` → `d15e8dc`)
 
-| ID | Fix | Status | Evidence |
-|----|-----|--------|----------|
-| A1 | Telemetry not broadcast | **DONE** | `AlertVisionBackend._broadcast_tick()` now returns and broadcasts the full telemetry packet each tick; `tests/test_phase_a_fixes.py::test_A1_telemetry_broadcast_sent_each_tick_with_zero_alerts` passes (fake broadcaster, zero alerts → exactly 1 telemetry broadcast). |
-| A2 | Alarm banner never shows | **PARTIAL** | `showAlarm`/`hideAlarm`/`armAutoClear`/`flashTile`/`playAlarmBeep` implemented in `script.js`; wired to `type:"alert"` and telemetry `cam.alert`; ACK via `hideAlarm`; mute button (`#ui-alarm-mute`) bound; auto-clear after 10s. **NOT unit tested** (browser-only). Requires visual QA. |
-| A3 | CRITICAL unreachable / density dead | **PARTIAL** | Formula CRITICAL at `risk >= CRITICAL_AT(0.85)` verified by test; density forced 4/m²→HIGH, 6/m²→CRITICAL verified by tests. **`capacity_people` not added** and **per-camera UI calibration not exposed** — still open. |
-| A4 | Requirements fake | **DONE** | Rewrote `requirements.txt` with real pins (opencv-python, numpy, websockets, ultralytics, torch, lapx); `requirements-optional.txt` = LWCC only; added `requirements-dev.txt` (pytest). |
-| A5 | Credential leak | **DONE** | Telemetry now sends `source` (masked) + `source_value_masked` (masked); raw `source_value` removed. `tests/test_phase_a_fixes.py::test_A5_no_raw_source_in_telemetry` passes (no raw cred in snapshot/offline packet). Frontend adopts masked source. |
-| A6 | Alert logic | **PARTIAL** | Cooldown now suppresses same-level repeats; escalation to higher level bypasses cooldown; alert_state updated only on fire/drop; removed broken uppercase `risk_thresholds.get(self.current_risk)` lookup (now uses `config["alert_threshold"]`). Threshold unification (moderate=0.6*high, critical=max(CRITICAL_AT, high+0.2)) approximated via `level_for`. **Alert-state machine not yet unit tested with flapping inputs.** |
+| Phase | Commit | Fixed IDs | Verified evidence |
+|---|---|---|---|
+| 0 — audit | `5e84626` | issue register created | `docs/ARCHITECTURE.md`, `docs/ISSUE_REGISTER.md` (46 issues) |
+| A — backend/concurrency | `06a461c` | I-A1…I-A12 | 12 new tests; alert priority queue; queue-accept ≠ browser receipt; masked/consistent connection payload; bounded CSV retries |
+| B — CV/analytics | `5f2b3ee` | I-B1…I-B9 | 10 synthetic scenarios; FPS/stride-independent EMA + rate; zoom-compensated flow; calibrated density; honest ETA; single HIGH threshold |
+| C — frontend/alerts | `a49e8f6` | I-C1…I-C9 | alert queue with severity guard; no 10 Hz alert storm; incremental viewports; CSV quoting/formula guard; UNKNOWN shown honestly |
+| D — security/launcher | `6476f8b` | I-D1, I-D2, I-D3, I-D5 | `commonpath` traversal fix; full-scheme origins; rate-limit feedback; `start.bat` background helper + PID cleanup (no machine-wide `taskkill`) |
+| E — performance | `92d32eb` | I-E1, I-E2, I-E4 | real 1/2/4/6-camera measurements in `docs/PERFORMANCE.md`; 12-client MJPEG case still NOT measured (I-E3 PARTIAL) |
+| F — tests | `d15e8dc` | I-F1, I-F2 | 64 tests: unit, integration (real WS/backend), stress (alert priority), frontend source-contract; dev requirement range dry-run verified in clean venv |
+| G — docs | this commit | I-G1, I-G2, I-G3 | README corrected; honesty/security/performance/verification docs added |
 
-## Phase B — Backend major bugs
+## DONE now (previously PARTIAL in Round 2)
 
-| ID | Fix | Status | Evidence |
-|----|-----|--------|----------|
-| B1 | Tracker/conf env bug | **DONE** | `tracker=os.environ.get("ALERT_VISION_TRACKER") or TRACKER_CONFIG`; `conf` from `ALERT_VISION_CONF` clamped 0.05–0.95; per-box re-filter uses resolved `conf`. |
-| B2 | Model failure | **DONE** | `_run` now pauses frames when `self.model is None`, publishes error packet with risk `UNKNOWN`, forces `current_risk="UNKNOWN"`, backs off via `_try_reconnect`. |
-| B3 | Port check order / stride parse | **DONE** | Port-free check moved before backend creation; `ALERT_VISION_STRIDE` parsed safely (try/except, clamp 1–10). |
-| B4 | Capture reader thread / reconnect / hot-swap | **PARTIAL** | Existing code already had reader thread, reconnect backoff, `_apply_pending_source` outside lock. Not re-verified in this round. |
-| B5 | Flow dt / mask / EMA | **PARTIAL** | `dt` used; flow stats use full frame (dilated mask not implemented). EMA time-based partially addressed via dt. |
-| B6 | apply_cameras semantics | **DONE** | Invalid spec → skipped, existing pipeline kept (test `test_B6_invalid_camera_spec_keeps_existing_pipeline` passes). |
-| B7 | Logging deadlock / rotation / history | **PARTIAL** | `_log_lock` nesting and retry order not re-verified this round. |
-| B8 | WS origin/send-timeout/token/get_state | **PARTIAL** | Origin check before register/history present; send-timeout present; token auth + `get_state` not implemented this round. |
-| B9 | test_source / connection state | **PARTIAL** | Not implemented this round. |
-| B10 | check_camera.py | **SKIPPED** | Not created. |
-| B11 | Backend | DONE | `/health` includes `version: "2.1.0"`; `cv2.destroyAllWindows()` removed from `run()`; `OPENCV_FFMPEG_CAPTURE_OPTIONS` set before `import cv2`; `torch.set_num_threads` at top of `main()`; compiles and passes `pytest` |
+| Item | Honest current status | Evidence |
+|---|---|---|
+| Telemetry broadcast each tick | **DONE** | `tests/test_phase_a_fixes.py`, integration test F1 |
+| Alarm banner / queue | **DONE** | severity-ranked `alertQueue`, dedupe, explicit `alert_ack` on display; source-contract tests C1/C2 |
+| CRITICAL reachable / density gate | **DONE** | 4/m²→HIGH, 6/m²→CRITICAL tests; calibrated density feeds risk term |
+| Alert-state flapping / hysteresis | **DONE** | time-based escalation 1.5s / de-escalation 4s; tests F6/F8 (state-machine constants + history vote) |
+| Capture reader / reconnect / hot-swap | **DONE** | worker-only handle release; backoff 2→30s; hot-swap test F7 |
+| Flow `dt` / mask / EMA | **DONE** | motion-masked + zoom-compensated divergence; velocity px/s; time-constant EMA |
+| Logging deadlock / rotation / history | **DONE** | nested `_log_lock` removed; bounded retries; `log_error` surfaced |
+| WS origin / send timeout / `get_state` | **DONE** (origin/timeout); `get_state` still additive-only | origin test D3; session loop closes timed-out clients |
+| `test_source` / connection state | **DONE** | ≤5 s off-loop probe; integration test F2 (FAILED ≤5 s) |
+| `check_camera.py` CLI | **DONE** | present, compiles, used by verification flow |
+| Diff-based `renderViewports` | **DONE** | incremental DOM sync; only changed sources re-attach |
+| Per-camera UI calibration | **DONE** (area_sqm / height+tilt+FOV / min_people via backend config); no `capacity_people` field | density tests + `density_calibrated` badge |
+| Camera filter in ledger | **NOT IMPLEMENTED** | intentionally not added; ledger shows all cameras (documented limitation) |
+| Token auth on WS | **NOT IMPLEMENTED** | loopback + Origin allow-list only; see `docs/SECURITY.md` |
 
-## Phase C — Frontend fixes
+## STILL NOT VERIFIED / LIMITATIONS
 
-| ID | Fix | Status | Evidence |
-|----|-----|--------|----------|
-| C1 | MJPEG recovery / NO SIGNAL | **DONE** | `restartStream` added; offline→online re-attach implemented; NO SIGNAL on `online=false`, `last_frame_age_ms>3000`, stale. |
-| C2 | Diff-based renderViewports | **PARTIAL** | Not implemented (full re-render retained). |
-| C3 | Frontend | DONE | status chip driven by `connection.state` + live "connecting… Ns" counter; model_error/log_error badge; Test connection wired to `test_source`; config only on Enter/Connect/blur (800ms debounce); MJPEG re-attach on offline→online; `tools/fake_mjpeg.py` (CONNECTED <3s, FAILED <6s with readable reason); `check_camera.py` CLI; verify with `python -m py_compile`, `pytest -q`, backend + fake MJPEG dashboard `CONNECTED < 3s`; `tools/ws_probe.py`; fake-server verification |
-| C4 | Real latency display | **DONE** | Removed fake `12ms`; shows `—`; colors `>1000ms` red, `>250ms` warn. |
-| C5 | RTSP saved-username password hint | **DONE** | `updateCardRefs` now shows "RTSP username saved — enter the camera password" when scheme is rtsp + username set. |
-| C6 | Ledger history/filter/colour/score/people/Download CSV | **PARTIAL** | History load, clear implemented; **Download CSV button added** (`#ui-ledger-download` + `bindLedgerDownload`); score+people added to rows; camera filter not implemented. |
-| C7 | Frontend | DONE | link watchdog reports stale/lost link status; tiles grey-out via `.viewport-grid.telemetry-stale` CSS class when telemetry stalls >3s; connected state persists on link loss; wired to `setTelemetryStalled()` on telemetry, WS close, and WS error |
+* Accuracy, small-person recall, ByteTrack ID-switch rate — `docs/ACCURACY_LIMITATIONS.md`.
+* 12 simultaneous MJPEG clients × 6 cameras — `docs/PERFORMANCE.md`.
+* Live DroidCam hardware (`192.168.1.106:4747`) in this audit run — pipeline
+  verification used `tools/fake_mjpeg.py`; real phone QA remains a manual step.
+* No cross-camera identity tracking is claimed anywhere.
+* LWCC is **not wired in this build**; `ALERT_VISION_LWCC` is reserved, not read.
 
-## Phase D — Launcher, docs, tests
+## Verification commands
 
-| ID | Fix | Status | Evidence |
-|----|-----|--------|----------|
-| D1 | Rewrite start.bat | **DONE** | Rewrote: Python 3.11 check, `.venv`, install-if-missing, port checks, whitelist static server (`serve_static.py` on 127.0.0.1:8000), backend, poll-ready, browser open. New `serve_static.py` compiles. |
-| D2 | Tests | **DONE** | `tests/` has 9 passing tests (core logic + Phase A/B fixes). Synthetic-video smoke mode not added. |
-| D3 | README | **DONE** | Setup, env vars, calibration, Connect-your-phone, troubleshooting, LWCC fixed. |
-| D4 | CHANGELOG rewrite | **DONE** | This file. |
+```powershell
+.\.venv\Scripts\python -m py_compile alert_vision.py analytics.py check_camera.py serve_static.py
+.\.venv\Scripts\python -m pytest -q          # 64 passed
+.\.venv\Scripts\python tools\verify_connect.py
+.\.venv\Scripts\python tools\benchmark_multicam.py --counts 1 2 4 6 --seconds 6
+```
 
-## Final status table (Round 2)
-
-| ID | Area | Status | One-line reason |
-|----|------|--------|-----------------|
-| A1 | Backend | DONE | Telemetry broadcast + test pass. |
-| A2 | Frontend | PARTIAL | Alarm logic implemented; browser-only, needs visual QA. |
-| A3 | Analytics | PARTIAL | Critical reachable; `capacity_people`/UI calibration still open. |
-| A4 | Build | DONE | Real pinned requirements. |
-| A5 | Security | DONE | No raw source in telemetry; masking test passes. |
-| A6 | Alerts | PARTIAL | Logic fixed; flapping-state unit tests still open. |
-| B1 | Backend | DONE | Env tracker/conf fixed. |
-| B2 | Backend | DONE | Model-unavailable pause implemented. |
-| B3 | Backend | DONE | Port check/stride parse fixed. |
-| B4 | Backend | PARTIAL | Not re-verified this round. |
-| B5 | Backend | PARTIAL | dt/mask/EMA not fully done. |
-| B6 | Backend | DONE | Invalid-spec keep-old test passes. |
-| B7 | Backend | PARTIAL | Not re-verified this round. |
-| B8 | Backend | PARTIAL | Token/get_state not done. |
-| B9 | Backend | DONE | test_source handler with 5s cap, test_result broadcast, _sanitize output; _connection_payload with state/error/elapsed_ms/resolved_url_masked |
-| B10 | Backend | SKIPPED | check_camera.py not created. |
-| B11 | Backend | DONE | `/health` includes `version: "2.1.0"`; `cv2.destroyAllWindows()` removed from `run()`; `OPENCV_FFMPEG_CAPTURE_OPTIONS` set before `import cv2`; `torch.set_num_threads` at top of `main()`; compiles and passes `pytest` |
-| C1 | Frontend | DONE | MJPEG recovery + tests/manual. |
-| C2 | Frontend | PARTIAL | Diff render not done. |
-| C3 | Frontend | DONE | status chip driven by `connection.state` + live "connecting… Ns" counter; model_error/log_error badge; Test connection wired to `test_source`; config only on Enter/Connect/blur (800ms debounce); MJPEG re-attach on offline→online; `tools/fake_mjpeg.py` (CONNECTED <3s, FAILED <6s with readable reason); `check_camera.py` CLI; verify with `python -m py_compile`, `pytest -q`, backend + fake MJPEG dashboard `CONNECTED < 3s`; `tools/ws_probe.py`; fake-server verification |
-| C4 | Frontend | DONE | Real latency. |
-| C5 | Frontend | DONE | RTSP password hint. |
-| C6 | Frontend | PARTIAL | CSV + score/people done; filter not done. |
-| C7 | Frontend | DONE | link watchdog reports stale/lost link status; tiles grey-out via `.viewport-grid.telemetry-stale` CSS class when telemetry stalls >3s; connected state persists on link loss; wired to `setTelemetryStalled()` on telemetry, WS close, and WS error |
-| D1 | Launcher | DONE | start.bat + serve_static.py. |
-| D2 | Tests | DONE | 9 tests pass. |
-| D3 | Docs | DONE | README updated. |
-| D4 | Docs | DONE | CHANGELOG rewritten. |
-
-## Manual QA checklist (required before marking anything else DONE)
-
-1. Open CSV in Excel while backend runs; watch alert rows append.
-2. Unplug camera and replug; watch NO SIGNAL → retry → reconnect.
-3. Kill/restart backend; verify history replay on WS connect.
-4. Two browser tabs; verify per-client ledger/queue behavior.
-5. Wrong IP/port/path; verify FAILED status + error text.
-6. RTSP wrong password; verify masked + hint.
-7. Alarm: force HIGH/CRITICAL; verify banner, beep, ACK, auto-clear, tile flash.
-
-## Assumptions
-
-* No new heavy dependencies added; `serve_static.py` uses stdlib only.
-* Vanilla JS frontend (no framework).
-* Python 3.11, Windows + Linux host.
-* `yolov8n.pt` untouched.
+See `docs/VERIFICATION.md` for the final status table with MANUALLY VERIFIED /
+NOT VERIFIED / BLOCKED distinctions.

@@ -42,9 +42,10 @@ def test_F6_reconnect_backoff_grows_and_caps_at_30s():
 
 
 def test_F7_hot_swap_queues_source_without_touching_handle():
+    # Construct directly: apply_cameras(initial=True) starts a worker that may
+    # consume the queued source before the assertion (flaky under full suite).
     state = SharedSystemState([], stride=1)
-    state.apply_cameras([{"id": "cam1", "label": "CAM 1", "source": 0}], initial=True)
-    pipe = state.cameras["cam1"]
+    pipe = CameraPipeline("cam1", "CAM 1", 0, state)
     pipe._source_dirty = False
     new_source = "http://127.0.0.1:4747/video"
     pipe.set_source(new_source)

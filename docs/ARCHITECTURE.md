@@ -93,4 +93,16 @@ MJPEG: grab_jpeg() → multipart stream → <img> per tile
 | Time-to-Critical honest | **PARTIAL — linear extrapolation labelled "ETA" without caveat (I-B6)** |
 | No broad exception swallowing | **FALSE — `_handle_connection` has bare `except Exception: pass` (I-A7)** |
 | start.bat browser helper opens browser, stops cleanly | **FALSE — user commit `13e891c` runs the helper synchronously *before* the backend boots and the generated PS1 is syntactically invalid; final cleanup no longer stops the static server (I-D1)** |
-| Frontend event counter ("0 events") | **FALSE — `ledgerEventCount` is never incremented (I-C6)** |
+| Frontend event counter ("0 events") | **FALSE at audit time — FIXED in Phase C (I-C6)** |
+
+## Phase G corrections to the claim table
+
+The verdicts above describe the code as found in Phase 0. After Phases A–G:
+
+* "Emergency alerts outrank telemetry" is now **TRUE** — separate priority queue (`I-A5`).
+* "Queue acceptance ≠ browser receipt" is now **TRUE** — explicit `alert_ack` on display (`I-A6`).
+* "Density never presented as physical measurement" is now **TRUE in UI** — `density_calibrated` gate shows "not calibrated" (`I-B5`/`I-C4`).
+* "Time-to-Critical honest" is now **TRUE as an estimate** — `~Xs (est)` plus caveat/r² (`I-B6`).
+* "No broad exception swallowing" is now **TRUE** for the WS handler (`I-A7`); remaining `except` blocks log or are explicit compatibility shims.
+* "start.bat browser helper opens browser, stops cleanly" is now **TRUE** — background helper + PID-scoped cleanup (`I-D1`).
+* "Frontend event counter" is now **TRUE** — increments on each ledger event (`I-C6`).

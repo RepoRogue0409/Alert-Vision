@@ -56,7 +56,7 @@ CrowdShield analytics for risk scoring, forecasting, and alerting.
 | Symptom                              | Likely cause                              | Fix                                                      |
 |--------------------------------------|-------------------------------------------|----------------------------------------------------------|
 | NO SIGNAL / NO SYNC                  | Phone not on same Wi‑Fi; wrong port/path  | Verify phone and PC are on same LAN, or use a Tailscale IP (`100.x.x.x`). Check the URL path. |
-| LINK LOST — RECONNECTING             | Backend WS connection dropped             | The watchdog will auto‑reconnect with exponential backoff (2s → 4s → 8s … 30s). |
+| LINK LOST — RECONNECTING             | Backend WS connection dropped             | The dashboard WebSocket watchdog reconnects on a fixed 2s cycle. Camera stream reconnect uses exponential backoff 2s → 4s → 8s … 30s. |
 | LINK STALE — NO TELEMETRY            | No camera frames received >3s ago         | Check camera feed; ensure the phone is streaming, not in standby. |
 | ALARM BANNER not appearing           | Risk level stays SAFE/MODERATE            | This is normal when density is below the HIGH (4/m²) threshold. |
 | CONFIG REJECTED — CHECK INPUT        | Invalid weight or threshold value         | Values must be between 0 and 1. Use the sliders.         |
@@ -72,18 +72,27 @@ CrowdShield analytics for risk scoring, forecasting, and alerting.
   `localStorage` under key `alertVision.cameraConfig.v1` — passwords are **excluded**.
 * On reconnect, the saved config is restored (without passwords); the UI will mark
   non‑webcam cameras as `CONNECTING` until the backend confirms they are online.
+* **Expected UX:** an already-open dashboard tab re-pushes its saved camera config
+  on every WebSocket reconnect, so a dashboard config overrides
+  `ALERT_VISION_SOURCE` on the next reconnect. Close the tab before running
+  pipeline-level source tests (`tools/verify_connect.py`).
 
 ## Development
 
-* `tests/test_core_logic.py` — synthetic-video smoke test; runs `from analytics import ...`
-  against the real module. All 5 tests must pass before commit.
-* `tests/test_phase_a_fixes.py`, `tests/test_phase_b_fixes.py` — Round-2 smoke tests for
-  telemetry broadcast, criticality, credential masking, apply_cameras.
-* `python -m py_compile alert_vision.py analytics.py` — must succeed.
-* `pytest` — currently 9 tests; more may be added in `tests/`.
+* `tests/` contains 64 automated tests (unit, analytics, frontend source-contract,
+  integration and stress). Run `python -m pytest -q` — 64 passed at last verification.
+* `python -m py_compile alert_vision.py analytics.py check_camera.py serve_static.py`
+  must succeed (also compile the tools when changing them).
+* `python tools/verify_connect.py` — measures CONNECTED <3s and FAILED <6s with a
+  synthetic camera. `python tools/benchmark_multicam.py --counts 1 2 4 6` reproduces
+  the measured performance table in `docs/PERFORMANCE.md`.
 * Do **not** modify `yolov8n.pt`; it is a read‑only model weight.
-* LWCC (`Lightweight Crowd Counting` library) is optional, off by default, and lazy‑imported;
-  enable with `ALERT_VISION_LWCC=1`. It must never crash the process if missing.
+* LWCC is intentionally **not wired into this build**. `requirements-optional.txt`
+  is provided for future use; no code path currently reads `ALERT_VISION_LWCC`.
+  Do not claim LWCC counting is active.
+* See `docs/VERIFICATION.md` for the final IMPLEMENTED / PASSED / MANUALLY VERIFIED /
+  NOT VERIFIED / BLOCKED status table and `docs/ACCURACY_LIMITATIONS.md` for
+  what the risk signals do and do not measure.
 
 ## Environment variables
 
@@ -94,7 +103,7 @@ CrowdShield analytics for risk scoring, forecasting, and alerting.
 | `ALERT_VISION_CONF` | Detection confidence (default 0.25, clamped 0.05–0.95). |
 | `ALERT_VISION_TRACKER` | ByteTrack tracker override. |
 | `ALERT_VISION_MODEL` | YOLO model path (default `yolov8n.pt`). |
-| `ALERT_VISION_LWCC` | `1` enables optional LWCC counting (lazy import, never crashes). |
+| `ALERT_VISION_LWCC` | Reserved for a future optional LWCC path; **not read by this build**. |
 | `ALERT_VISION_ALLOWED_ORIGINS` | Comma-separated allowed browser origins. |
 
 ### Torch / Ultralytics note
