@@ -97,6 +97,14 @@ CrowdShield analytics for risk scoring, forecasting, and alerting.
 | `ALERT_VISION_LWCC` | `1` enables optional LWCC counting (lazy import, never crashes). |
 | `ALERT_VISION_ALLOWED_ORIGINS` | Comma-separated allowed browser origins. |
 
+### Torch / Ultralytics note
+`ultralytics` pulls the **CPU** build of `torch` as its default. For a CUDA build, install
+`torch` from the CUDA index separately before/instead of letting ultralytics resolve it:
+```
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+```
+The backend selects the device via `ALERT_VISION_*`/default inference device and falls back to CPU.
+
 ## Calibration guide
 
 Per-camera density calibration:

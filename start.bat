@@ -25,10 +25,25 @@ if not exist ".venv\Scripts\python.exe" (
 call ".venv\Scripts\activate.bat"
 
 echo :: [3/6] Installing core requirements only when missing
-python -c "import cv2" >nul 2>nul
+python -c "import cv2, numpy, websockets, ultralytics" >nul 2>nul
 if errorlevel 1 (
   echo :: Installing requirements.txt ...
   python -m pip install -r requirements.txt
+  if errorlevel 1 (
+    echo :: PIP_INSTALL_FAILED - aborting startup. See package error above. Retry with:
+    echo ::   python -m pip install -r requirements.txt
+    taskkill /f /im python.exe >nul 2>nul
+    pause
+    exit /b 1
+  )
+)
+python -c "import cv2, numpy, websockets, ultralytics" >nul 2>nul
+if errorlevel 1 (
+  echo :: IMPORT_CHECK_FAILED - aborting startup. Install with:
+  echo ::   python -m pip install -r requirements.txt
+  taskkill /f /im python.exe >nul 2>nul
+  pause
+  exit /b 1
 )
 
 echo :: [4/6] Checking ports 8000 / 8765 / 8766 are free
