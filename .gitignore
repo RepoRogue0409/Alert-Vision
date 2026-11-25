@@ -14,5 +14,8 @@ crowdshield_alert_log.csv
 
 # Optional / generated
 
+# Virtual environment (created by start.bat)
+.venv/
+
 # Windows Thumbs.db
 Thumbs.db
