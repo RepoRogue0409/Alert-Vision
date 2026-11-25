@@ -1,2 +1,4 @@
 # Development dependencies - Alert Vision
-pytest==8.3.3
+# Range verified in the project venv with pytest 9.2.0 (`python -m pytest --version`).
+# 8.3.3 was the previously pinned version; both are covered by this range.
+pytest>=8.3.3,<10

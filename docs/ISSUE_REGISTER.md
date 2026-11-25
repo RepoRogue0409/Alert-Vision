@@ -47,8 +47,8 @@
 | I-E2 | S2 | perf | Each camera = 1 thread + 1 model loader + **separate YOLO instance** (6× yolov8n weights in RAM) — needs measured RSS/CPU at 1/2/4/6 cams | E | FIXED (measured) |
 | I-E3 | S3 | perf | MJPEG `time.sleep(0.04)` fixed 25fps per client regardless of camera FPS; up to 12 clients × 6 cams unmeasured | E | PARTIAL (1 client measured; 12-client case NOT measured) |
 | I-E4 | S3 | perf | No benchmark harness exists at all — all perf claims would be unmeasured | E | FIXED (measured) |
-| I-F1 | S2 | tests | No test covers: alert queue priority, hysteresis state machine, hot-swap, reconnect backoff, CSV escaping, WS rate limit, `_validate_source` edge cases | F | OPEN |
-| I-F2 | S4 | tests | `requirements-dev.txt` pins `pytest==8.3.3` but venv actually has 9.2.0 (installed via `--target`) — pin drift | F | OPEN |
+| I-F1 | S2 | tests | No test covers: alert queue priority, hysteresis state machine, hot-swap, reconnect backoff, CSV escaping, WS rate limit, `_validate_source` edge cases | F | FIXED (unit/integration/stress guards added) |
+| I-F2 | S4 | tests | `requirements-dev.txt` pins `pytest==8.3.3` but venv actually has 9.2.0 (installed via `--target`) — pin drift | F | FIXED (range verified in clean venv) |
 | I-G1 | S4 | docs | README says "All 5 tests must pass" + "pytest — currently 9 tests" (stale counts), claims "backoff 2s→4s…30s" for *link* watchdog that is actually fixed 2s, LWCC env var claimed but no code path reads `ALERT_VISION_LWCC` | G | OPEN |
 | I-G2 | S4 | docs | CHANGELOG Round-2 table has PARTIAL rows (B4/B5/B7/B8, A2/A3/A6, C2/C6) that later commits actually fixed — statuses stale in both directions | G | OPEN |
 | I-G3 | S4 | docs | No architecture/benchmark/security/limitation reports existed before this audit | G | OPEN |
