@@ -68,15 +68,22 @@
   };
 
   var RISK_COLORS = {
+    UNKNOWN: "#64748b",
     SAFE: "#10b981",
     MODERATE: "#eab308",
     HIGH: "#f97316",
     CRITICAL: "#ef4444"
   };
 
-  var RISK_RANK = { SAFE: 0, MODERATE: 1, HIGH: 2, CRITICAL: 3 };
+  /* I-C1/C9: UNKNOWN is below SAFE; it must never be displayed as a measured SAFE. */
+  var RISK_RANK = { UNKNOWN: -1, SAFE: 0, MODERATE: 1, HIGH: 2, CRITICAL: 3 };
 
   var ACTION_GUIDELINES = {
+    UNKNOWN: [
+      "Model loading \u2014 risk analysis is not available yet",
+      "Raw video is being relayed; no people count is reported",
+      "Wait for the MODEL LOADING badge to clear"
+    ],
     SAFE: [
       "\ud83d\udc4d Continue routine monitoring",
       "\ud83d\udc40 Keep the feed on wider screen",
@@ -138,6 +145,10 @@
   var configFlashTimer = null;
   var latencyEma = null;
   var alarmState = { alertId: 0, cameraId: "", level: "SAFE" };
+  /* I-C1/I-C2: pending alerts are QUEUED, never silently overwritten by a
+     lower-severity alert. The banner shows the highest-priority alert only. */
+  var alertQueue = [];
+  var queuedAlertIds = {};
   var audioCtx = null;
 
   var state = {
@@ -172,6 +183,7 @@
 
   function normalizeLevel(level) {
     var upper = typeof level === "string" ? level.toUpperCase() : "SAFE";
+    if (upper === "UNKNOWN") return "UNKNOWN";
     return RISK_COLORS[upper] ? upper : "SAFE";
   }
 
@@ -551,93 +563,117 @@
     }, VIDEO_WATCHDOG_MS);
   }
 
-  function renderViewports() {
-    if (!ui.viewportGrid) return;
-    clearViewTimers();
-    ui.viewportGrid.innerHTML = "";
+  function viewportSourceKey(cam) {
+    return JSON.stringify([
+      cam.kind, cam.index, cam.host, cam.port, cam.path, cam.protocol, cam.url, cam.source
+    ]);
+  }
 
-    state.cameras.forEach(function (cam, index) {
-      var tile = document.createElement("div");
-      tile.className = "cam-tile" + (cam.id === state.activeId ? " focused" : "");
-      tile.dataset.cam = cam.id;
-      tile.tabIndex = 0;
-      tile.setAttribute("role", "button");
-      tile.setAttribute("aria-pressed", cam.id === state.activeId ? "true" : "false");
-      tile.setAttribute("aria-label", cameraLabel(cam, index) + " \u2014 activate to focus this camera");
+  function createViewportTile(cam, index) {
+    var tile = document.createElement("div");
+    tile.className = "cam-tile" + (cam.id === state.activeId ? " focused" : "");
+    tile.dataset.cam = cam.id;
+    tile.tabIndex = 0;
+    tile.setAttribute("role", "button");
+    tile.setAttribute("aria-pressed", cam.id === state.activeId ? "true" : "false");
+    tile.setAttribute("aria-label", cameraLabel(cam, index) + " \u2014 activate to focus this camera");
 
-      var head = document.createElement("div");
-      head.className = "cam-head";
-      var title = document.createElement("span");
-      title.className = "cam-title";
-      title.textContent = cameraLabel(cam, index);
-      var badge = document.createElement("span");
-      badge.className = "cam-badge";
-      badge.textContent = "IDLE";
-      head.appendChild(title);
-      head.appendChild(badge);
+    var head = document.createElement("div");
+    head.className = "cam-head";
+    var title = document.createElement("span");
+    title.className = "cam-title";
+    title.textContent = cameraLabel(cam, index);
+    var badge = document.createElement("span");
+    badge.className = "cam-badge";
+    badge.textContent = "IDLE";
+    head.appendChild(title);
+    head.appendChild(badge);
 
-      var videoBox = document.createElement("div");
-      videoBox.className = "video-box";
-      var img = document.createElement("img");
-      img.className = "cam-stream";
-      img.alt = "Live stream for " + cameraLabel(cam, index);
-      videoBox.appendChild(img);
+    var videoBox = document.createElement("div");
+    videoBox.className = "video-box";
+    var img = document.createElement("img");
+    img.className = "cam-stream";
+    img.alt = "Live stream for " + cameraLabel(cam, index);
+    videoBox.appendChild(img);
 
-      var noSignal = document.createElement("div");
-      noSignal.className = "no-signal visible";
-      var noSignalTitle = document.createElement("strong");
-      noSignalTitle.textContent = "NO SIGNAL";
-      var noSignalText = document.createElement("span");
-      noSignalText.textContent = "Connecting to camera stream\u2026";
-      noSignal.appendChild(noSignalTitle);
-      noSignal.appendChild(noSignalText);
-      videoBox.appendChild(noSignal);
+    var noSignal = document.createElement("div");
+    noSignal.className = "no-signal visible";
+    var noSignalTitle = document.createElement("strong");
+    noSignalTitle.textContent = "NO SIGNAL";
+    var noSignalText = document.createElement("span");
+    noSignalText.textContent = "Connecting to camera stream\u2026";
+    noSignal.appendChild(noSignalTitle);
+    noSignal.appendChild(noSignalText);
+    videoBox.appendChild(noSignal);
 
-      var foot = document.createElement("div");
-      foot.className = "cam-foot";
-      var people = document.createElement("span");
-      people.className = "cam-people";
-      people.textContent = "People: 0";
-      var score = document.createElement("span");
-      score.className = "cam-score";
-      score.textContent = "Score 0.00";
-      foot.appendChild(people);
-      foot.appendChild(score);
+    var foot = document.createElement("div");
+    foot.className = "cam-foot";
+    var people = document.createElement("span");
+    people.className = "cam-people";
+    people.textContent = "People: 0";
+    var score = document.createElement("span");
+    score.className = "cam-score";
+    score.textContent = "Score 0.00";
+    foot.appendChild(people);
+    foot.appendChild(score);
 
-      tile.appendChild(head);
-      tile.appendChild(videoBox);
-      tile.appendChild(foot);
+    tile.appendChild(head);
+    tile.appendChild(videoBox);
+    tile.appendChild(foot);
 
-      tile.addEventListener("click", function () {
+    tile.addEventListener("click", function () {
+      selectCamera(cam.id);
+    });
+    tile.addEventListener("keydown", function (event) {
+      if (event.key === "Enter" || event.key === " " || event.key === "Spacebar") {
+        event.preventDefault();
         selectCamera(cam.id);
-      });
-      tile.addEventListener("keydown", function (event) {
-        if (event.key === "Enter" || event.key === " " || event.key === "Spacebar") {
-          event.preventDefault();
-          selectCamera(cam.id);
-        }
-      });
-
-      ui.viewportGrid.appendChild(tile);
-
-      var refs = {
-        tile: tile,
-        img: img,
-        title: title,
-        badge: badge,
-        people: people,
-        score: score,
-        noSignal: noSignal,
-        noSignalText: noSignalText,
-        watchTimer: null,
-        retryTimer: null,
-        failedAttempts: 0,
-        online: false
-      };
-      viewRefs[cam.id] = refs;
-      attachStream(cam.id, refs);
+      }
     });
 
+    ui.viewportGrid.appendChild(tile);
+    var refs = {
+      tile: tile, img: img, title: title, badge: badge, people: people,
+      score: score, noSignal: noSignal, noSignalText: noSignalText,
+      watchTimer: null, retryTimer: null, failedAttempts: 0, online: false,
+      sourceKey: viewportSourceKey(cam)
+    };
+    viewRefs[cam.id] = refs;
+    attachStream(cam.id, refs);
+    return refs;
+  }
+
+  /* I-C3/I-C7: incremental DOM sync. Existing <img> streams are NEVER
+     re-attached unless that camera's source actually changed. */
+  function renderViewports() {
+    if (!ui.viewportGrid) return;
+    var wanted = {};
+    state.cameras.forEach(function (cam, index) {
+      wanted[cam.id] = true;
+      var refs = viewRefs[cam.id];
+      var label = cameraLabel(cam, index);
+      if (!refs) {
+        refs = createViewportTile(cam, index);
+      } else {
+        refs.title.textContent = label;
+        refs.img.alt = "Live stream for " + label;
+        refs.tile.setAttribute("aria-label", label + " \u2014 activate to focus this camera");
+        var key = viewportSourceKey(cam);
+        if (refs.sourceKey !== key) {
+          refs.sourceKey = key;
+          restartStream(cam.id, refs);
+        }
+      }
+      refs.tile.classList.toggle("focused", cam.id === state.activeId);
+      refs.tile.setAttribute("aria-pressed", cam.id === state.activeId ? "true" : "false");
+    });
+    Object.keys(viewRefs).forEach(function (id) {
+      if (wanted[id]) return;
+      clearStreamTimers(viewRefs[id]);
+      var tile = viewRefs[id].tile;
+      if (tile.parentNode) tile.parentNode.removeChild(tile);
+      delete viewRefs[id];
+    });
     updateFocusLabel();
   }
 
@@ -806,12 +842,11 @@
     }
     if (packet.type === "alert") {
       appendLedgerFromEvent(packet);
-      showAlarm(packet);
+      queueAlert(packet);
       /* I-A6: explicit BROWSER RECEIPT - the backend keeps the alert queued
-         (queue acceptance only) until this ack or the receipt grace expires. */
-      if (socket && socket.readyState === WebSocket.OPEN && packet.alert_id) {
-        socket.send(JSON.stringify({ type: "alert_ack", alert_id: packet.alert_id }));
-      }
+         (queue acceptance only) until this ack or the receipt grace expires.
+         Receipt is sent when the alert is DISPLAYED (see showAlarm), not when
+         it is merely queued in the browser. */
       return;
     }
     if (packet.type === "config_ack") {
@@ -847,8 +882,9 @@
 
     if (!backendAdopted && !camerasEdited && packet.cameras.length > 0) {
       backendAdopted = true;
+      /* I-C8: adopt once, then continue updating tiles from THIS packet
+         instead of dropping its telemetry until the next 100ms tick. */
       adoptBackendCameras(packet.cameras);
-      return;
     }
 
     packet.cameras.forEach(function (cam) {
@@ -875,12 +911,9 @@
       updateFocus(active);
     }
 
-    packet.cameras.forEach(function (cam) {
-      if (cam.alert === true) {
-        showAlarm(cam);
-        appendLedgerFromEvent(cam);
-      }
-    });
+    /* I-C2: telemetry is NOT an alert delivery channel. Alerts arrive once as
+       type:"alert" packets; re-showing on every 10Hz telemetry packet caused a
+       flash/beep storm and duplicate ledger rows. */
   }
 
   function adoptBackendCameras(cameras) {
@@ -1015,6 +1048,33 @@
     var level = normalizeLevel(cam.risk_level);
     var color = riskColor(level);
 
+    /* I-C9: UNKNOWN means "model loading", NOT a measured SAFE state. */
+    if (level === "UNKNOWN") {
+      ui.headcount.textContent = "\u2014";
+      ui.risk.textContent = "UNKNOWN";
+      ui.risk.style.color = color;
+      ui.risk.style.textShadow = "none";
+      if (ui.latency) {
+        ui.latency.textContent = "\u2014";
+        ui.latency.title = "Analysis not available while the model loads";
+        latencyEma = null;
+      }
+      [ui.barDensityValue, ui.barRateValue, ui.barConvergenceValue, ui.barTurbulenceValue].forEach(function (node) {
+        if (node) node.textContent = "\u2014";
+      });
+      if (ui.infoDensityPsm) ui.infoDensityPsm.textContent = "\u2014";
+      if (ui.infoEta) ui.infoEta.textContent = "\u2014";
+      if (ui.infoLevelFormula) ui.infoLevelFormula.textContent = "UNKNOWN";
+      if (ui.infoLevelDensity) ui.infoLevelDensity.textContent = "UNKNOWN";
+      var unknownKey = cam.id + ":UNKNOWN";
+      if (adviceKey !== unknownKey) {
+        renderAdvice("UNKNOWN");
+        adviceKey = unknownKey;
+      }
+      if (ui.focusLabel) ui.focusLabel.textContent = "FOCUS: " + (cam.label || cam.id);
+      return;
+    }
+
     ui.headcount.textContent = String(Math.max(0, Math.round(toNumber(cam.people_now, 0))));
     ui.risk.textContent = level;
     ui.risk.style.color = color;
@@ -1145,16 +1205,68 @@
     }
   }
 
+  function alertRankOf(cam) {
+    return RISK_RANK[normalizeLevel(cam && cam.risk_level)] || 0;
+  }
+
+  function refreshAlarmQueueHint() {
+    if (!ui.alarmMeta || !alertQueue.length) return;
+    var base = String(ui.alarmMeta.dataset.base || ui.alarmMeta.textContent || "");
+    ui.alarmMeta.dataset.base = base;
+    ui.alarmMeta.textContent = base + " \u00b7 +" + alertQueue.length + " queued";
+  }
+
+  /* I-C1: lower-priority alerts are queued, never silently overwritten. */
+  function queueAlert(cam) {
+    if (!cam) return;
+    var id = toInt(cam.alert_id, 0);
+    if (id > 0 && queuedAlertIds[id]) return;
+    if (id > 0 && alarmVisible() && toInt(alarmState.alertId, 0) === id) return;
+    if (!alarmVisible() || alertRankOf(cam) > (RISK_RANK[alarmState.level] || 0)) {
+      if (id > 0) delete queuedAlertIds[id];
+      showAlarm(cam);
+      return;
+    }
+    if (id > 0) queuedAlertIds[id] = true;
+    alertQueue.push(cam);
+    refreshAlarmQueueHint();
+  }
+
+  function nextQueuedAlert() {
+    if (!alertQueue.length) return null;
+    alertQueue.sort(function (a, b) { return alertRankOf(b) - alertRankOf(a); });
+    var next = alertQueue.shift();
+    var id = toInt(next.alert_id, 0);
+    if (id > 0) delete queuedAlertIds[id];
+    return next;
+  }
+
   function showAlarm(cam) {
     var level = normalizeLevel(cam && cam.risk_level ? cam.risk_level : alarmState.level);
     if (RISK_RANK[level] < ALARM_MIN_RANK) {
       return;
     }
+    var newId = toInt(cam && cam.alert_id, 0);
+    /* I-C2: a duplicate (same alert already on screen) never re-beeps. */
+    if (newId > 0 && newId === toInt(alarmState.alertId, 0) && alarmVisible()) {
+      return;
+    }
+    /* I-C1: preserve a displaced lower-severity alert in the queue. */
+    var previous = alarmState.event || null;
+    if (alarmVisible() && previous && toInt(previous.alert_id, 0) > 0
+        && toInt(previous.alert_id, 0) !== newId) {
+      var previousId = toInt(previous.alert_id, 0);
+      if (!queuedAlertIds[previousId]) {
+        queuedAlertIds[previousId] = true;
+        alertQueue.push(previous);
+      }
+    }
     alarmState = {
-      alertId: toInt(cam && cam.alert_id, 0),
+      alertId: newId,
       cameraId: String((cam && (cam.camera_id || cam.id)) || ""),
       level: level,
-      muted: alarmMuted
+      muted: alarmMuted,
+      event: cam
     };
     if (ui.alarm) {
       ui.alarm.classList.add("visible");
@@ -1175,7 +1287,9 @@
     var stamp = toNumber(cam.timestamp, Date.now());
     parts.push(new Date(stamp).toLocaleTimeString());
     if (ui.alarmMeta) {
-      ui.alarmMeta.textContent = parts.join(" \u00b7 ");
+      ui.alarmMeta.dataset.base = parts.join(" \u00b7 ");
+      ui.alarmMeta.textContent = ui.alarmMeta.dataset.base;
+      refreshAlarmQueueHint();
     }
     flashTile(alarmState.cameraId);
     var refs = viewRefs[alarmState.cameraId];
@@ -1184,6 +1298,11 @@
     }
     playAlarmBeep(alarmMuted);
     armAutoClear(alarmState.cameraId, level);
+    /* I-A6: BROWSER RECEIPT is sent only when the alert is actually displayed,
+       never when it is merely accepted into a browser queue. */
+    if (newId > 0 && socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "alert_ack", alert_id: newId }));
+    }
   }
 
   function hideAlarm() {
@@ -1193,6 +1312,10 @@
     }
     var previousCameraId = alarmState.cameraId;
     alarmState = { alertId: 0, cameraId: "", level: "SAFE", muted: alarmMuted };
+    if (ui.alarmMeta) {
+      ui.alarmMeta.dataset.base = "";
+      ui.alarmMeta.textContent = "";
+    }
     if (ui.alarm) {
       ui.alarm.classList.remove("visible");
       ui.alarm.style.display = "none";
@@ -1201,6 +1324,10 @@
     if (refs && refs.tile) {
       refs.tile.classList.remove("alarm");
     }
+    /* I-C1: after the higher-priority alert clears, surface the next queued
+       alert instead of silently discarding it. */
+    var next = nextQueuedAlert();
+    if (next) showAlarm(next);
   }
 
   function renderAdvice(level) {
@@ -1271,6 +1398,9 @@
     }
 
     ledgerEvents.push(event);
+    /* I-C6: the header counter must reflect real events, never a frozen 0. */
+    ledgerEventCount += 1;
+    if (ui.ledgerCount) ui.ledgerCount.textContent = ledgerEventCount + " events";
     while (ledgerEvents.length > MAX_LEDGER_ROWS) {
       ledgerEvents.shift();
     }
@@ -1936,12 +2066,20 @@
     });
   }
 
+  /* I-C5: RFC-4180 quoting + spreadsheet formula-injection guard. */
+  function csvCell(value) {
+    var text = value === null || value === undefined ? "" : String(value);
+    if (/^[=+\-@\t\r]/.test(text)) text = "'" + text;
+    if (/[",\r\n]/.test(text)) text = '"' + text.replace(/"/g, '""') + '"';
+    return text;
+  }
+
   function bindLedgerDownload() {
     if (!ui.ledgerDownload) return;
     ui.ledgerDownload.addEventListener("click", function () {
       if (!ledgerEvents || ledgerEvents.length === 0) return;
       var header = ["timestamp", "camera", "risk_level", "action", "risk_score", "people_now"];
-      var rows = [header.join(",")];
+      var rows = [header.map(csvCell).join(",")];
       ledgerEvents.forEach(function (event) {
         var cells = [
           new Date(toNumber(event.timestamp, Date.now())).toISOString(),
@@ -1951,7 +2089,7 @@
           String(toNumber(event.risk_score, 0).toFixed(2)),
           String(Math.max(0, Math.round(toNumber(event.people_now, 0) || 0))),
         ];
-        rows.push(cells.join(","));
+        rows.push(cells.map(csvCell).join(","));
       });
       var blob = new Blob([rows.join("\n")], { type: "text/csv" });
       var url = URL.createObjectURL(blob);
