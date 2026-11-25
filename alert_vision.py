@@ -522,6 +522,27 @@ class CameraPipeline:
                 self.model_error = f"model_load_failed: {error}"
                 print(f":: [Alert Vision] {self.id} model load failed -> {error}")
         while not self.stop_event.is_set():
+            if self.model is None:
+                # B2: YOLO model unavailable -> never run frames; surface error, pause + back off.
+                if self.model_error is None:
+                    self.model_error = "model_unavailable"
+                    print(f":: [Alert Vision] {self.id} model unavailable -> frames paused")
+                with self.frame_lock:
+                    self.latest_frame = None
+                    self.latest_jpeg = None
+                self.current_risk = "UNKNOWN"
+                packet = self._offline_packet()
+                packet["risk_level"] = "UNKNOWN"
+                packet["risk_score"] = 0.0
+                packet["alert"] = False
+                packet["action"] = "NONE"
+                packet["alert_id"] = 0
+                packet["online"] = False
+                packet["last_frame_age_ms"] = 3000.0
+                self._publish(packet)
+                self._try_reconnect()
+                time.sleep(0.1)
+                continue
             self._apply_pending_source()
             frame = self.read_frame()
             if frame is None:
@@ -1624,15 +1645,19 @@ def _port_free(port: int) -> bool:
 
 def main() -> None:
     torch.set_num_threads(max(1, min(4, os.cpu_count() or 2)))
-    stride = int(os.environ.get("ALERT_VISION_STRIDE") or DEFAULT_STRIDE)
+    try:
+        stride = int(os.environ.get("ALERT_VISION_STRIDE") or DEFAULT_STRIDE)
+    except (TypeError, ValueError):
+        stride = DEFAULT_STRIDE
     stride = max(1, min(10, stride))
-    backend = AlertVisionBackend(_initial_specs(), stride=stride, log_file=LOG_FILE)
+    # B3: check ports BEFORE creating the backend / starting any camera pipeline.
     if not _port_free(WEBSOCKET_PORT) or not _port_free(VIDEO_PORT):
         print(
             f":: [Alert Vision] Port busy - another instance may already be running "
             f"(ws://{HOST}:{WEBSOCKET_PORT} / http://{HOST}:{VIDEO_PORT})"
         )
         return
+    backend = AlertVisionBackend(_initial_specs(), stride=stride, log_file=LOG_FILE)
     try:
         asyncio.run(backend.run())
     except KeyboardInterrupt:
