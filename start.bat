@@ -62,10 +62,42 @@ if errorlevel 1 (
 
 echo :: [5/6] Starting whitelist static dashboard server on http://127.0.0.1:8000/
 start /min /b python serve_static.py
+
+echo :: [6/6] Launching browser-helper & booting backend
+:: -- Launch hidden background PowerShell helper that polls backend health
+::    and opens the dashboard browser on first success.
+set PS_SCRIPT=%TEMP%\av_browser_helper.ps1
+echo $i = 0 > "%PS_SCRIPT%"
+echo :retry >> "%PS_SCRIPT%"
+echo $i = $i + 1 >> "%PS_SCRIPT%"
+echo if $i -ge 90 (>> "%PS_SCRIPT%"
+echo :: Timeout: print manual URL and exit >> "%PS_SCRIPT%"
+echo echo :: Timeout opening browser. Open http://127.0.0.1:8000/ manually >> "%PS_SCRIPT%"
+echo exit 1 >> "%PS_SCRIPT%"
+echo ) >> "%PS_SCRIPT%"
+echo $r = Invoke-WebRequest http://127.0.0.1:8766/health -UseBasicParsing >> "%PS_SCRIPT%"
+echo if ($r.StatusCode -eq 200) { >> "%PS_SCRIPT%"
+echo :: On success, open dashboard and exit >> "%PS_SCRIPT%"
+echo powershell -ExecutionPolicy Bypass -Command "Start-Process http://127.0.0.1:8000" >> "%PS_SCRIPT%"
+echo exit 0 >> "%PS_SCRIPT%"
+echo } else { >> "%PS_SCRIPT%"
+echo :: Wait 1 second then retry >> "%PS_SCRIPT%"
+echo Start-Sleep -Seconds 1 >> "%PS_SCRIPT%"
+echo goto retry >> "%PS_SCRIPT%"
+echo } >> "%PS_SCRIPT%"
+powershell -ExecutionPolicy Bypass -File "%PS_SCRIPT%" >nul 2>&1
+del "%PS_SCRIPT%"
+
+echo :: Waiting for backend, browser will open automatically
+
 echo :: [6/6] Booting asynchronous analytics backend
 python -u alert_vision.py
 
 echo :: Alert Vision backend process terminated
+
+:: Cleanup any leftover PowerShell process
+taskkill /f /im powershell.exe >nul 2>nul
+
 echo :: Stopping static dashboard server
-taskkill /f /im python.exe >nul 2>nul
+
 pause
