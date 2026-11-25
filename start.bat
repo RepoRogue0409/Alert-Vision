@@ -33,13 +33,13 @@ if errorlevel 1 (
 
 echo :: [4/6] Checking ports 8000 / 8765 / 8766 are free
 python -c "import socket;s=socket.socket();r=s.connect_ex(('127.0.0.1',8765));s.close();raise SystemExit(1 if r==0 else 0)" >nul 2>nul
-if not errorlevel 1 (
+if errorlevel 1 (
   echo :: Port 8765 busy - another instance may already be running.
   pause
   exit /b 1
 )
 python -c "import socket;s=socket.socket();r=s.connect_ex(('127.0.0.1',8766));s.close();raise SystemExit(1 if r==0 else 0)" >nul 2>nul
-if not errorlevel 1 (
+if errorlevel 1 (
   echo :: Port 8766 busy - another instance may already be running.
   pause
   exit /b 1

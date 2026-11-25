@@ -2,6 +2,6 @@
 opencv-python==4.10.0.84
 numpy==1.26.4
 websockets==12.0
-ultralytics==8.0.88
+ultralytics==8.0.34
 torch==2.2.2
-lapx==0.0.9
+lapx==0.9.0
