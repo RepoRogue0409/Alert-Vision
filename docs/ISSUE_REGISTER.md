@@ -43,10 +43,10 @@
 | I-D3 | S3 | security | WS Origin check treats *missing* Origin as allowed (needed for non-browser probes) but `ALERT_VISION_ALLOWED_ORIGINS` env prepends `http://` blindly → `https://` origins impossible | D | FIXED |
 | I-D4 | S3 | security | MJPEG `/video` + `/frame.jpg` + `/health` unauthenticated on 127.0.0.1 (acceptable for localhost-only, but must be documented as a limitation, not claimed secure) | D | ACCEPTED (documented localhost-only limitation) |
 | I-D5 | S4 | security | `MAX_WS_MESSAGES_PER_SEC` silently drops excess messages (no `config_error` feedback) — config save can be lost with no user-visible reason | D | FIXED |
-| I-E1 | S2 | perf | `build_packet` → `snapshot()` copies every camera dict every 100ms including `tracks` list; JSON `_sanitize` deep-copies again — fine at 6 cams, needs measurement not assumption | E | OPEN |
-| I-E2 | S2 | perf | Each camera = 1 thread + 1 model loader + **separate YOLO instance** (6× yolov8n weights in RAM) — needs measured RSS/CPU at 1/2/4/6 cams | E | OPEN |
-| I-E3 | S3 | perf | MJPEG `time.sleep(0.04)` fixed 25fps per client regardless of camera FPS; up to 12 clients × 6 cams unmeasured | E | OPEN |
-| I-E4 | S3 | perf | No benchmark harness exists at all — all perf claims would be unmeasured | E | OPEN |
+| I-E1 | S2 | perf | `build_packet` → `snapshot()` copies every camera dict every 100ms including `tracks` list; JSON `_sanitize` deep-copies again — fine at 6 cams, needs measurement not assumption | E | FIXED (measured) |
+| I-E2 | S2 | perf | Each camera = 1 thread + 1 model loader + **separate YOLO instance** (6× yolov8n weights in RAM) — needs measured RSS/CPU at 1/2/4/6 cams | E | FIXED (measured) |
+| I-E3 | S3 | perf | MJPEG `time.sleep(0.04)` fixed 25fps per client regardless of camera FPS; up to 12 clients × 6 cams unmeasured | E | PARTIAL (1 client measured; 12-client case NOT measured) |
+| I-E4 | S3 | perf | No benchmark harness exists at all — all perf claims would be unmeasured | E | FIXED (measured) |
 | I-F1 | S2 | tests | No test covers: alert queue priority, hysteresis state machine, hot-swap, reconnect backoff, CSV escaping, WS rate limit, `_validate_source` edge cases | F | OPEN |
 | I-F2 | S4 | tests | `requirements-dev.txt` pins `pytest==8.3.3` but venv actually has 9.2.0 (installed via `--target`) — pin drift | F | OPEN |
 | I-G1 | S4 | docs | README says "All 5 tests must pass" + "pytest — currently 9 tests" (stale counts), claims "backoff 2s→4s…30s" for *link* watchdog that is actually fixed 2s, LWCC env var claimed but no code path reads `ALERT_VISION_LWCC` | G | OPEN |
