@@ -10,7 +10,7 @@ CrowdShield analytics for risk scoring, forecasting, and alerting.
 
    ```powershell
    pip install -r requirements.txt
-   # Optional: pip install -r requirements-optional.txt  # LWCC, streamlit, etc.
+   # Optional: pip install -r requirements-optional.txt  # LWCC only
    ```
 
 2. **Start the stack**
@@ -77,10 +77,34 @@ CrowdShield analytics for risk scoring, forecasting, and alerting.
 
 * `tests/test_core_logic.py` — synthetic-video smoke test; runs `from analytics import ...`
   against the real module. All 5 tests must pass before commit.
+* `tests/test_phase_a_fixes.py`, `tests/test_phase_b_fixes.py` — Round-2 smoke tests for
+  telemetry broadcast, criticality, credential masking, apply_cameras.
 * `python -m py_compile alert_vision.py analytics.py` — must succeed.
-* `pytest` — currently 5 core logic tests; more may be added in `tests/`.
+* `pytest` — currently 9 tests; more may be added in `tests/`.
 * Do **not** modify `yolov8n.pt`; it is a read‑only model weight.
-* LWCC (Live Weather & Crowd Conditions) is optional, off by default, and lazy‑imported.
+* LWCC (`Lightweight Crowd Counting` library) is optional, off by default, and lazy‑imported;
+  enable with `ALERT_VISION_LWCC=1`. It must never crash the process if missing.
+
+## Environment variables
+
+| Var | Purpose |
+|-----|---------|
+| `ALERT_VISION_SOURCE` / `ALERT_VISION_SOURCES` | Comma-separated camera sources (e.g. `0,http://192.168.1.50:8080/video`). |
+| `ALERT_VISION_STRIDE` | Inference stride (default 1, clamped 1–10). |
+| `ALERT_VISION_CONF` | Detection confidence (default 0.25, clamped 0.05–0.95). |
+| `ALERT_VISION_TRACKER` | ByteTrack tracker override. |
+| `ALERT_VISION_MODEL` | YOLO model path (default `yolov8n.pt`). |
+| `ALERT_VISION_LWCC` | `1` enables optional LWCC counting (lazy import, never crashes). |
+| `ALERT_VISION_ALLOWED_ORIGINS` | Comma-separated allowed browser origins. |
+
+## Calibration guide
+
+Per-camera density calibration:
+* `area_sqm` — known crowd area in square metres (people/m² density).
+* OR `height_m` + `tilt_deg` + `hfov` / `vfov` — camera geometry, from which ground area is estimated.
+* OR `min_people` — capacity hint (default 3).
+
+Density gates: 4 people/m² → HIGH, 6 people/m² → CRITICAL (density‑forced levels).
 
 ## License
 
