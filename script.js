@@ -47,6 +47,7 @@
     ledger: document.getElementById("ui-ledger-box"),
     ledgerCount: document.getElementById("ui-ledger-count"),
     ledgerClear: document.getElementById("ui-ledger-clear"),
+    ledgerDownload: document.getElementById("ui-ledger-download"),
     alarm: document.getElementById("ui-alarm"),
     alarmTitle: document.getElementById("ui-alarm-title"),
     alarmMeta: document.getElementById("ui-alarm-meta"),
@@ -131,6 +132,7 @@
   var channelRefs = {};
   var seenAlertIds = {};
   var ledgerEventCount = 0;
+  var ledgerEvents = [];
   var lastTelemetryAt = 0;
   var linkTimer = null;
   var configFlashTimer = null;
@@ -525,7 +527,28 @@
     refs.img.addEventListener("error", function () {
       scheduleStreamRetry(camId, refs);
     });
-    attemptStream(camId, refs);
+    restartStream(camId, refs);
+  }
+
+  /* C1: fresh stream attach without duplicating listeners; hides NO SIGNAL. */
+  function restartStream(camId, refs) {
+    refs.failedAttempts = 0;
+    if (refs.retryTimer) {
+      clearTimeout(refs.retryTimer);
+      refs.retryTimer = null;
+    }
+    if (refs.watchTimer) {
+      clearTimeout(refs.watchTimer);
+      refs.watchTimer = null;
+    }
+    setNoSignal(refs, false, "");
+    refs.img.src = STREAM_URL + "?cam=" + encodeURIComponent(camId) + "&t=" + Date.now();
+    refs.watchTimer = setTimeout(function () {
+      refs.watchTimer = null;
+      if (!refs.img.naturalWidth) {
+        scheduleStreamRetry(camId, refs);
+      }
+    }, VIDEO_WATCHDOG_MS);
   }
 
   function renderViewports() {
@@ -608,7 +631,8 @@
         noSignalText: noSignalText,
         watchTimer: null,
         retryTimer: null,
-        failedAttempts: 0
+        failedAttempts: 0,
+        online: false
       };
       viewRefs[cam.id] = refs;
       attachStream(cam.id, refs);
@@ -903,8 +927,28 @@
     refs.people.textContent = "People: " + Math.max(0, Math.round(toNumber(cam.people_now, 0)));
     refs.score.textContent = "Score " + toNumber(cam.risk_score, 0).toFixed(2);
 
+    var wasOnline = refs.online === true;
+    refs.online = !!cam.online;
     if (!cam.online) {
       setNoSignal(refs, true, "CAMERA OFFLINE \u2014 CHECK SOURCE");
+    } else {
+      if (!wasOnline) {
+        /* C1: offline -> online transition: reset stream state and re-attach. */
+        refs.failedAttempts = 0;
+        if (refs.retryTimer) {
+          clearTimeout(refs.retryTimer);
+          refs.retryTimer = null;
+        }
+        if (refs.watchTimer) {
+          clearTimeout(refs.watchTimer);
+          refs.watchTimer = null;
+        }
+        setNoSignal(refs, false, "");
+        restartStream(cam.id, refs);
+      }
+    }
+    if (cam.online && toNumber(cam.last_frame_age_ms, 0) > 3000) {
+      setNoSignal(refs, true, "NO SIGNAL \u2014 STALE FRAME");
     }
     refs.tile.classList.toggle(
       "alarm",
@@ -960,7 +1004,7 @@
     } else {
       var shown = Math.max(1, Math.round(latencyEma));
       ui.latency.textContent = shown + "ms";
-      ui.latency.style.color = shown > 150 ? RISK_COLORS.CRITICAL : shown > 60 ? RISK_COLORS.MODERATE : "#00f2fe";
+      ui.latency.style.color = shown > 1000 ? RISK_COLORS.CRITICAL : shown > 250 ? RISK_COLORS.MODERATE : "#00f2fe";
       ui.latency.title = "Network " + shown + "ms \u00b7 frame age " + Math.round(frameAge) + "ms";
     }
 
@@ -1162,15 +1206,30 @@
     var actionKey = typeof event.action === "string" ? event.action.toUpperCase() : "NONE";
     actionCell.textContent = ACTION_LABELS[actionKey] || ACTION_LABELS.NONE;
 
+    var scoreCell = document.createElement("div");
+    scoreCell.textContent = "Score " + toNumber(event.risk_score, 0).toFixed(2);
+    scoreCell.style.color = riskColor(level);
+
+    var peopleCell = document.createElement("div");
+    peopleCell.textContent = "People " + Math.max(0, Math.round(toNumber(event.people_now, 0) || 0));
+    peopleCell.style.color = "#cbd5e1";
+
     row.appendChild(timeCell);
     row.appendChild(camCell);
     row.appendChild(levelCell);
     row.appendChild(actionCell);
+    row.appendChild(scoreCell);
+    row.appendChild(peopleCell);
 
     if (header) {
       header.insertAdjacentElement("afterend", row);
     } else {
       ui.ledger.appendChild(row);
+    }
+
+    ledgerEvents.push(event);
+    while (ledgerEvents.length > MAX_LEDGER_ROWS) {
+      ledgerEvents.shift();
     }
 
     while (ui.ledger.children.length > MAX_LEDGER_ROWS + 1) {
@@ -1291,7 +1350,8 @@
   function removeCamera(camId) {
     if (state.cameras.length <= 1) return;
     var removedView = viewRefs[camId];
-    if (removedView && removedView.snapTimer) clearInterval(removedView.snapTimer);
+    if (removedView && removedView.retryTimer) clearTimeout(removedView.retryTimer);
+    if (removedView && removedView.watchTimer) clearTimeout(removedView.watchTimer);
     state.cameras = state.cameras.filter(function (cam) {
       return cam.id !== camId;
     });
@@ -1360,6 +1420,9 @@
     if (refs.hint) {
       if (cam.kind === "webcam") {
         refs.hint.textContent = "Uses a webcam attached to this PC.";
+      } else if (cam.scheme === "rtsp" && cam.username) {
+        /* C5: saved RTSP username -> tell the operator to enter the password. */
+        refs.hint.textContent = "RTSP username saved \u2014 enter the camera password (masked, re-enter if needed).";
       } else {
         var info = classifyHost(cam.host);
         if (info.kind === "tailscale") {
@@ -1721,6 +1784,48 @@
     });
   }
 
+  function bindLedgerClear() {
+    if (!ui.ledgerClear) return;
+    ui.ledgerClear.addEventListener("click", function () {
+      if (ui.ledger) {
+        ui.ledger.innerHTML = "";
+      }
+      ledgerEvents = [];
+      seenAlertIds = {};
+      ledgerEventCount = 0;
+      if (ui.ledgerCount) ui.ledgerCount.textContent = "0 events";
+    });
+  }
+
+  function bindLedgerDownload() {
+    if (!ui.ledgerDownload) return;
+    ui.ledgerDownload.addEventListener("click", function () {
+      if (!ledgerEvents || ledgerEvents.length === 0) return;
+      var header = ["timestamp", "camera", "risk_level", "action", "risk_score", "people_now"];
+      var rows = [header.join(",")];
+      ledgerEvents.forEach(function (event) {
+        var cells = [
+          new Date(toNumber(event.timestamp, Date.now())).toISOString(),
+          String(event.camera_label || event.label || event.camera_id || event.id || "Camera"),
+          String(event.risk_level || "SAFE"),
+          String(event.action || "NONE"),
+          String(toNumber(event.risk_score, 0).toFixed(2)),
+          String(Math.max(0, Math.round(toNumber(event.people_now, 0) || 0))),
+        ];
+        rows.push(cells.join(","));
+      });
+      var blob = new Blob([rows.join("\n")], { type: "text/csv" });
+      var url = URL.createObjectURL(blob);
+      var anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = "crowdshield_alert_log.csv";
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      URL.revokeObjectURL(url);
+    });
+  }
+
   function bindControls() {
     if (ui.addChannel) {
       ui.addChannel.addEventListener("click", addCamera);
@@ -1751,6 +1856,7 @@
 
     bindAlarmAck();
     bindLedgerClear();
+    bindLedgerDownload();
   }
 
   function bindAlarmAck() {
