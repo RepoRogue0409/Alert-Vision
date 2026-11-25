@@ -1006,8 +1006,9 @@
   function formatEta(seconds) {
     var eta = toNumber(seconds, NaN);
     if (!isFinite(eta) || eta < 0) return "\u2014";
-    if (eta < 60) return Math.round(eta) + "s";
-    return Math.floor(eta / 60) + "m " + Math.round(eta % 60) + "s";
+    /* I-B6: a linear extrapolation is an estimate, never a measured time. */
+    var text = eta < 60 ? Math.round(eta) + "s" : Math.floor(eta / 60) + "m " + Math.round(eta % 60) + "s";
+    return "~" + text + " (est)";
   }
 
   function updateFocus(cam) {
@@ -1046,8 +1047,15 @@
     updateBar(ui.barTurbulence, ui.barTurbulenceValue, cam.risk_turbulence);
 
     if (ui.infoDensityPsm) {
-      var psm = toNumber(cam.density_per_sqm, 0);
-      ui.infoDensityPsm.textContent = psm.toFixed(2);
+      /* I-B5/I-C4: never present an uncalibrated density as a measured zero. */
+      if (cam.density_calibrated === false || !(cam.area_sqm > 0)) {
+        ui.infoDensityPsm.textContent = "not calibrated";
+        ui.infoDensityPsm.title = "Set camera area (m\u00b2) or height/tilt/FOV to enable people/m\u00b2";
+      } else {
+        var psm = toNumber(cam.density_per_sqm, 0);
+        ui.infoDensityPsm.textContent = psm.toFixed(2);
+        ui.infoDensityPsm.title = "Estimated from calibrated visible floor area";
+      }
     }
     var formulaLevel = normalizeLevel(cam.risk_level_formula);
     if (ui.infoLevelFormula) {
@@ -1061,6 +1069,10 @@
     }
     if (ui.infoEta) {
       ui.infoEta.textContent = formatEta(cam.forecast_eta_s);
+      var estimate = cam.forecast_estimate || null;
+      ui.infoEta.title = estimate && estimate.caveat
+        ? estimate.caveat + " (linear trend over " + estimate.samples + " samples)"
+        : "No reliable estimate; this is not a prediction of absence of risk";
     }
 
     var adviceKey = cam.id + ":" + level;

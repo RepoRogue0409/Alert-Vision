@@ -36,26 +36,55 @@ RISK_LEVELS = ("SAFE", "MODERATE", "HIGH", "CRITICAL")
 LEVEL_RANK = {"SAFE": 0, "MODERATE": 1, "HIGH": 2, "CRITICAL": 3}
 DEFAULT_WEIGHTS = {"density": 0.4, "rate_of_change": 0.2, "convergence": 0.2, "turbulence": 0.2}
 DEFAULT_MIN_PEOPLE = 3
+# I-B1/I-B2: all time-derived terms are normalized against a nominal 15 FPS
+# sample so the same real-world change scores the same at stride 1 or stride 10.
+NOMINAL_SAMPLE_DT = 1.0 / 15.0
+# A normalized-density rise of 2.0 per second (10 people/s at min_people=3)
+# is treated as a full rate-of-change signal. Documented, not a physical law.
+RATE_FULL_PER_SEC = 2.0
+# Calibrated density anchor: 1 person/m^2 -> 0, 6 people/m^2 -> 1 (the
+# CRITICAL density threshold). Used only when the camera has a calibrated area.
+DENSITY_NORM_LOW = 1.0
+FLOW_DT_MIN = 1e-3
+FLOW_DT_MAX = 1.0
 
 
 # ---------------------------------------------------------------------------
 # Optical flow signal
 # ---------------------------------------------------------------------------
-def compute_flow_signal(prev_gray, gray, dt: float = 0.066, mask=None, flow=None):
-    """Return ``(turbulence, divergence)`` for one frame pair.
+def flow_velocity(flow, dt: float) -> float:
+    """Mean optical-flow magnitude in pixels/second (I-B3).
 
-    * turbulence: ``1 - |resultant flow angle|`` over samples with magnitude
-      above the motion threshold (0 = no direction change, 1 = full chaos).
-    * divergence: spatial divergence proxy derived from flow gradients.
-
-    Camera-shake compensation subtracts the global median flow vector. Both
-    outputs are ``0..1``-family signals (turbulence is exactly 0..1); ``dt`` is
-    accepted for API compatibility and clamped out of the angle-based ratio.
-
-    ``flow`` may carry a precomputed Farneback flow matrix (advanced callers);
-    when omitted it is computed from the two frames.
+    Callers must pass the measured wall-clock ``dt`` between the two frames; a
+    per-frame magnitude is not comparable across camera FPS or inference stride.
     """
-    if prev_gray is None or gray is None:
+    flow_arr = np.asarray(flow)
+    if flow_arr.size == 0:
+        return 0.0
+    secs = min(max(float(dt) if dt else NOMINAL_SAMPLE_DT, FLOW_DT_MIN), FLOW_DT_MAX)
+    magnitude = np.hypot(flow_arr[..., 0].astype(np.float32), flow_arr[..., 1].astype(np.float32))
+    return float(np.mean(magnitude)) / secs
+
+
+def compute_flow_signal(prev_gray, gray, dt: float = NOMINAL_SAMPLE_DT, mask=None, flow=None,
+                        compensate_zoom: bool = True):
+    """Return ``(turbulence, divergence_per_second)`` for one frame pair.
+
+    * turbulence: ``1 - |resultant flow angle|`` over moving pixels (0 =
+      aligned motion, 1 = full chaos).
+    * divergence: motion-masked spatial divergence proxy, normalized to
+      **per second** using the measured ``dt`` (I-B3). Camera translation is
+      removed via the global median; a least-squares radial term is optionally
+      removed to suppress camera zoom (I-B4). Static background pixels are
+      excluded from the divergence estimate (I-B4).
+
+    ``flow`` may carry a precomputed Farneback flow matrix; when omitted it is
+    computed from the two frames. A caller-supplied ``mask`` overrides the
+    automatic motion mask.
+    """
+    # A caller may supply a precomputed flow matrix without the gray frames
+    # (used by synthetic regression tests and advanced callers).
+    if flow is None and (prev_gray is None or gray is None):
         return 0.0, 0.0
     import cv2
 
@@ -72,14 +101,39 @@ def compute_flow_signal(prev_gray, gray, dt: float = 0.066, mask=None, flow=None
     angles = angles.astype(np.float32)
     if mask is None:
         mask = magnitude > 0.3
+    else:
+        mask = np.asarray(mask, dtype=bool)
     sampled = angles[mask]
     if sampled.size > 0:
         resultant = float(np.hypot(float(np.mean(np.sin(sampled))), float(np.mean(np.cos(sampled)))))
         turbulence = float(1.0 - resultant)
     else:
         turbulence = 0.0
-    divergence = float(np.mean(np.gradient(fx, axis=1) + np.gradient(fy, axis=0))) if fx.size else 0.0
-    return float(turbulence), float(divergence)
+
+    # I-B4: motion-masked divergence. Without this, stationary background
+    # pixels dominate the mean gradient and dilute genuine crowd convergence.
+    ys, xs = np.nonzero(mask)
+    if ys.size < 4 or fx.size == 0:
+        return float(turbulence), 0.0
+
+    if compensate_zoom and ys.size > 16:
+        # Remove a least-squares radial (zoom) component from the moving
+        # pixels: flow ~= a * (x - cx, y - cy).  Pure translation is already
+        # removed by the median above; pure zoom therefore collapses to ~0.
+        cx = (fx.shape[1] - 1) / 2.0
+        cy = (fx.shape[0] - 1) / 2.0
+        rx = xs.astype(np.float32) - cx
+        ry = ys.astype(np.float32) - cy
+        denom = float(np.dot(rx, rx) + np.dot(ry, ry))
+        if denom > 1e-6:
+            radial = (float(np.dot(rx, fx[ys, xs])) + float(np.dot(ry, fy[ys, xs]))) / denom
+            fx[ys, xs] -= radial * rx
+            fy[ys, xs] -= radial * ry
+
+    grad = np.gradient(fx, axis=1) + np.gradient(fy, axis=0)
+    divergence_raw = float(np.mean(grad[ys, xs]))
+    secs = min(max(float(dt) if dt else NOMINAL_SAMPLE_DT, FLOW_DT_MIN), FLOW_DT_MAX)
+    return float(turbulence), float(divergence_raw / secs)
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +149,9 @@ class LiveAnalyzer:
 
     TURB_LOW = 0.15
     TURB_FULL = 0.75
+    # Reference smoothing per NOMINAL_SAMPLE_DT (15 FPS). Effective alpha is
+    # recomputed from measured dt so a 5 FPS stream is smoothed the same as a
+    # 15 FPS stream over the same wall-clock interval (I-B2).
     LEVELING_ALPHA = 0.25
 
     def __init__(self, window: int = 50, weights=None, min_people: float = DEFAULT_MIN_PEOPLE, critical_at: float = CRITICAL_AT):
@@ -109,9 +166,15 @@ class LiveAnalyzer:
         self.risk_times = deque(maxlen=self.window)
         self.prev_gray = None
         self.prev_den = 0.0
+        # I-B1/I-B2: wall-clock bookkeeping for FPS/stride-independent terms.
+        self._last_add_at = None
+        self._last_sample_dt = NOMINAL_SAMPLE_DT
         self.smooth_turb = 0.0
         self.smooth_risk = 0.0
-        self.last_terms = {"density": 0.0, "rate_of_change": 0.0, "convergence": 0.0, "turbulence": 0.0}
+        self.last_terms = {
+            "density": 0.0, "rate_of_change": 0.0, "convergence": 0.0,
+            "turbulence": 0.0, "density_per_sqm": 0.0,
+        }
         self.t0 = time.time()
 
     @staticmethod
@@ -128,9 +191,14 @@ class LiveAnalyzer:
         self.risk_times.clear()
         self.prev_gray = None
         self.prev_den = 0.0
+        self._last_add_at = None
+        self._last_sample_dt = NOMINAL_SAMPLE_DT
         self.smooth_turb = 0.0
         self.smooth_risk = 0.0
-        self.last_terms = {"density": 0.0, "rate_of_change": 0.0, "convergence": 0.0, "turbulence": 0.0}
+        self.last_terms = {
+            "density": 0.0, "rate_of_change": 0.0, "convergence": 0.0,
+            "turbulence": 0.0, "density_per_sqm": 0.0,
+        }
 
     def _resolve_weights(self, w_density, w_rate_of_change, w_convergence, w_turbulence, min_people):
         weights = {
@@ -145,24 +213,58 @@ class LiveAnalyzer:
             total = float(sum(weights.values()))
         return weights, float(min_people if min_people is not None else self.min_people)
 
-    def add(self, count, turb, div, w_density=None, w_rate_of_change=None, w_convergence=None, w_turbulence=None, min_people=None) -> float:
-        """Feed one analysed frame; returns the EMA-smoothed risk score (0..1)."""
+    @staticmethod
+    def _effective_alpha(dt: float) -> float:
+        """EMA alpha for ``dt`` seconds, equivalent to LEVELING_ALPHA @15 FPS."""
+        ratio = min(max(float(dt) / NOMINAL_SAMPLE_DT, 0.05), 20.0)
+        return float(1.0 - (1.0 - LiveAnalyzer.LEVELING_ALPHA) ** ratio)
+
+    def add(self, count, turb, div, w_density=None, w_rate_of_change=None, w_convergence=None,
+            w_turbulence=None, min_people=None, dt=None, area_sqm=None) -> float:
+        """Feed one analysed frame; returns the time-smoothed risk score (0..1).
+
+        ``dt`` is the measured seconds since the previous analysed frame. When
+        omitted it is derived from wall-clock samples, so callers that already
+        know the interval (the camera worker) should pass it explicitly.
+
+        ``area_sqm`` (when calibrated, >0) feeds the physical density anchor
+        into the density term (I-B5); with no calibration the legacy people-
+        count normalization is used.
+        """
         count = float(count)
         turb = float(turb)
         div = float(div)
+        now = time.monotonic()
+        if self._last_add_at is None:
+            sample_dt = float(dt) if dt is not None else NOMINAL_SAMPLE_DT
+        else:
+            sample_dt = float(dt) if dt is not None else (now - float(self._last_add_at))
+        sample_dt = min(max(sample_dt, 0.001), 2.0)
+        self._last_add_at = now
+        self._last_sample_dt = sample_dt
+        alpha = self._effective_alpha(sample_dt)
+
         self.people.append(count)
         self.turb.append(turb)
         self.div.append(div)
 
         weights, mp = self._resolve_weights(w_density, w_rate_of_change, w_convergence, w_turbulence, min_people)
-        window_peak = float(max(self.people)) if len(self.people) else 0.0
-        den = self._demean_norm(count, mp - 1.0, mp + 4.0)
-        ddt = den - self.prev_den
+        den_count = self._demean_norm(count, mp - 1.0, mp + 4.0)
+        psm = density_per_sqm(count, area_sqm) if area_sqm and float(area_sqm) > 0.0 else 0.0
+        # I-B5: calibrated density can only ADD risk, never mask the count term.
+        den_cal = self._demean_norm(psm, DENSITY_NORM_LOW, DENSITY_CRITICAL_PER_SQM) if psm > 0.0 else 0.0
+        den = float(max(den_count, den_cal))
+
+        # I-B1: first sample has no rate history -> no spurious spike.
+        if len(self.people) <= 1:
+            rate_norm = 0.0
+        else:
+            rate_norm = float(np.clip(max(den - self.prev_den, 0.0) / sample_dt / RATE_FULL_PER_SEC, 0.0, 1.0))
         self.prev_den = den
 
         presence = float(np.clip(count / max(mp, 1.0), 0.0, 1.0))
         turb_n = self._demean_norm(turb, self.TURB_LOW, self.TURB_FULL)
-        self.smooth_turb = self.LEVELING_ALPHA * turb_n + (1.0 - self.LEVELING_ALPHA) * self.smooth_turb
+        self.smooth_turb = alpha * turb_n + (1.0 - alpha) * self.smooth_turb
         turb_smooth = self.smooth_turb * presence
 
         div_arr = np.asarray(self.div)
@@ -175,7 +277,7 @@ class LiveAnalyzer:
             np.clip(
                 (
                     weights["density"] * den
-                    + weights["rate_of_change"] * max(ddt, 0.0)
+                    + weights["rate_of_change"] * rate_norm
                     + weights["convergence"] * conv
                     + weights["turbulence"] * turb_smooth
                 )
@@ -187,37 +289,69 @@ class LiveAnalyzer:
         if count == 0.0:
             self.smooth_risk = 0.0
         else:
-            self.smooth_risk = (1.0 - self.LEVELING_ALPHA) * self.smooth_risk + self.LEVELING_ALPHA * risk_val
+            self.smooth_risk = (1.0 - alpha) * self.smooth_risk + alpha * risk_val
         self.last_terms = {
             "density": float(den),
-            "rate_of_change": float(max(ddt, 0.0)),
+            "rate_of_change": float(rate_norm),
             "convergence": float(conv),
             "turbulence": float(turb_smooth),
+            "density_per_sqm": float(psm),
         }
         self.risk.append(float(self.smooth_risk))
         self.risk_times.append(time.time())
         return float(self.smooth_risk)
 
-    def forecast_seconds_to_critical(self, critical_at: float = None, min_samples: int = 6, max_horizon: float = 180.0):
-        """Linear-fit ETA (seconds) until the risk crosses ``critical_at``."""
+    def forecast_estimate(self, critical_at: float = None, min_samples: int = 6,
+                          max_horizon: float = 180.0, min_span_seconds: float = 2.0) -> dict:
+        """Honest linear-trend estimate (I-B6).
+
+        Returns a dict with ``eta_s``, ``slope_per_s``, ``r2``, ``samples`` and
+        an explicit ``caveat``. A straight-line extrapolation of an EMA is a
+        *trend estimate*, not a prediction or a calibrated time-to-event.
+        ``None`` eta means "no reliable estimate", never "no risk".
+        """
+        empty = {
+            "eta_s": None, "slope_per_s": None, "r2": None, "samples": len(self.risk),
+            "method": "least-squares linear trend over recent EMA samples",
+            "caveat": "estimate only; not a calibrated prediction",
+        }
         critical = float(self.critical_at if critical_at is None else critical_at)
         if len(self.risk) < int(min_samples):
-            return None
+            return empty
         times = np.asarray(self.risk_times, dtype=float)
         risks = np.asarray(self.risk, dtype=float)
         t_rel = times - times[0]
-        if t_rel[-1] <= 0.0:
-            return None
-        slope, _intercept = np.polyfit(t_rel, risks, 1)
-        if slope <= 1e-4:
-            return None
+        span = float(t_rel[-1] - t_rel[0])
+        # Guard duplicate timestamps explicitly; avoids np.polyfit RankWarning.
+        if span < float(min_span_seconds) or not np.any(np.diff(t_rel) > 0.0):
+            return empty
+        tc = t_rel - float(np.mean(t_rel))
+        rc = risks - float(np.mean(risks))
+        denom = float(np.dot(tc, tc))
+        if denom <= 1e-9:
+            return empty
+        slope = float(np.dot(tc, rc)) / denom
+        intercept = float(np.mean(risks)) - slope * float(np.mean(t_rel))
+        predicted = intercept + slope * t_rel
+        ss_res = float(np.sum((risks - predicted) ** 2))
+        ss_tot = float(np.sum(rc ** 2))
+        r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else 0.0
         current_risk = float(risks[-1])
-        if current_risk >= critical:
-            return None
-        eta = (critical - current_risk) / float(slope)
-        if eta <= 0.0 or eta > float(max_horizon):
-            return None
-        return float(eta)
+        eta = None
+        if slope > 1e-4 and current_risk < critical:
+            candidate = (critical - current_risk) / slope
+            if 0.0 < candidate <= float(max_horizon):
+                eta = float(candidate)
+        empty.update({
+            "eta_s": eta, "slope_per_s": slope, "r2": float(np.clip(r2, 0.0, 1.0)),
+            "samples": len(self.risk),
+        })
+        return empty
+
+    def forecast_seconds_to_critical(self, critical_at: float = None, min_samples: int = 6,
+                                     max_horizon: float = 180.0):
+        """Backward-compatible eta-only wrapper around :meth:`forecast_estimate`."""
+        return self.forecast_estimate(critical_at, min_samples, max_horizon)["eta_s"]
 
 
 # ---------------------------------------------------------------------------

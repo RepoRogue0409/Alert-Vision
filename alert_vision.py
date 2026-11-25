@@ -73,9 +73,12 @@ from analytics import (
     compute_flow_signal,
     confidence_live,
     density_forced_level,
+    density_history_vote,
     density_per_sqm,
     estimate_ground_area,
+    flow_velocity,
     level_for,
+    NOMINAL_SAMPLE_DT,
 )
 
 try:
@@ -337,6 +340,7 @@ class CameraPipeline:
         self.frame_counter = 0
         self.prev_small = None
         self.prev_flow_time = None
+        self._last_processed_at = None
         self.latest_frame = None
         self.latest_jpeg = None
         # I-A2/I-A3: `online`/`frame_time` are written by the worker and read
@@ -360,6 +364,10 @@ class CameraPipeline:
 
         self.seen_ids = set()
         self.risk_history = deque(maxlen=DEBOUNCE_WINDOW)
+        # I-B7: density-forced levels are majority-voted so a single noisy
+        # detection cannot clear an otherwise sustained high-density state.
+        self.density_level_history = deque(maxlen=8)
+        self._last_density_level = None
         self.current_risk = "SAFE"
         self.alert_state = "SAFE"
         self.risk_score = 0.0
@@ -625,7 +633,10 @@ class CameraPipeline:
         self.frame_counter = 0
         self.prev_small = None
         self.prev_flow_time = None
+        self._last_processed_at = None
         self.risk_history.clear()
+        self.density_level_history.clear()
+        self._last_density_level = None
         with contextlib.suppress(Exception):
             self.analyzer.reset()
         self.current_risk = "SAFE"
@@ -853,6 +864,14 @@ class CameraPipeline:
             )
             height, width = frame.shape[:2]
 
+        # I-B1/I-B2: measured interval between ANALYSED frames (includes stride).
+        processed_at = time.monotonic()
+        if self._last_processed_at is None:
+            processed_dt = NOMINAL_SAMPLE_DT
+        else:
+            processed_dt = min(max(processed_at - float(self._last_processed_at), 0.001), 2.0)
+        self._last_processed_at = processed_at
+
         config = self.state.config_snapshot()
         detections = []
         confidences = []
@@ -916,16 +935,32 @@ class CameraPipeline:
             w_convergence=weights.get("convergence"),
             w_turbulence=weights.get("turbulence"),
             min_people=self.min_people,
+            dt=processed_dt,
+            area_sqm=self.area_sqm,
         )
+        # I-B9: ONE source of truth. validate_config() mirrors alert_threshold
+        # into risk_thresholds["high"], so formula HIGH and the alert gate can
+        # never disagree.
         formula_level = level_for(
             risk_score,
             threshold=float(config["alert_threshold"]),
             critical_at=float(config["risk_thresholds"].get("critical", CRITICAL_AT)),
         )
-        density_level = density_forced_level(people_now, self.area_sqm) if self.area_sqm else None
+        raw_density_level = density_forced_level(people_now, self.area_sqm) if self.area_sqm else None
+        # I-B7: escalate immediately; hold a forced level until the majority
+        # vote agrees it has cleared (avoids one-frame flapping).
+        self.density_level_history.append(raw_density_level or "SAFE")
+        voted_clear = density_history_vote(self.density_level_history, agree_needed=4)
+        if raw_density_level is not None:
+            density_level = raw_density_level
+        elif self._last_density_level is not None and voted_clear is None:
+            density_level = self._last_density_level
+        else:
+            density_level = None
+        self._last_density_level = density_level
         instant_level = combine_levels(formula_level, density_level)
         density_psm = density_per_sqm(people_now, self.area_sqm) if self.area_sqm else 0.0
-        forecast_eta = self.analyzer.forecast_seconds_to_critical(
+        forecast = self.analyzer.forecast_estimate(
             critical_at=float(config["risk_thresholds"].get("critical", CRITICAL_AT))
         )
 
@@ -1021,13 +1056,17 @@ class CameraPipeline:
             "source_value_masked": _source_display(self.source),
             "online": True,
             "people_now": int(people_now),
+            # I-B8: backward-compatible field retained, but explicitly labelled.
             "unique_ids": int(len(self.seen_ids)),
+            "track_ids_seen": int(len(self.seen_ids)),
+            "unique_ids_meaning": "cumulative ByteTrack IDs (includes re-identifications; NOT unique people)",
             "tracks": [int(d[5]) for d in detections if d[5] is not None],
             "risk_level": self.current_risk,
             "risk_score": float(risk_score),
             "confidence": float(confidence_live(len(self.analyzer.risk), confidences)),
             "density": float(density),
             "density_per_sqm": float(density_psm),
+            "density_calibrated": bool(self.area_sqm),
             "turbulence": float(turbulence),
             "convergence": float(terms.get("convergence", 0.0)),
             "risk_density": float(terms.get("density", 0.0)),
@@ -1037,7 +1076,8 @@ class CameraPipeline:
             "velocity": float(velocity),
             "risk_level_formula": formula_level,
             "risk_level_density": density_level or "SAFE",
-            "forecast_eta_s": float(forecast_eta) if forecast_eta is not None else None,
+            "forecast_eta_s": float(forecast["eta_s"]) if forecast["eta_s"] is not None else None,
+            "forecast_estimate": dict(forecast),
             "area_sqm": float(self.area_sqm) if self.area_sqm else None,
             "min_people": float(self.min_people),
             "timestamp": float(now_ms),
@@ -1092,7 +1132,8 @@ class CameraPipeline:
         self.prev_flow_time = now_mono
         flow = cv2.calcOpticalFlowFarneback(previous, small, None, 0.5, 3, 15, 3, 5, 1.2, 0)
         turbulence, divergence = compute_flow_signal(previous, small, dt=dt, flow=flow)
-        velocity = float(np.mean(np.hypot(flow[..., 0], flow[..., 1])))
+        # I-B3: publish pixels/SECOND, not pixels/frame (FPS/stride comparable).
+        velocity = flow_velocity(flow, dt)
         return float(turbulence), float(divergence), float(velocity)
 
     # -- telemetry snapshots -------------------------------------------------
@@ -1105,12 +1146,15 @@ class CameraPipeline:
             "online": False,
             "people_now": 0,
             "unique_ids": int(len(self.seen_ids)),
+            "track_ids_seen": int(len(self.seen_ids)),
+            "unique_ids_meaning": "cumulative ByteTrack IDs (includes re-identifications; NOT unique people)",
             "tracks": [],
             "risk_level": "SAFE",
             "risk_score": 0.0,
             "confidence": 0.0,
             "density": 0.0,
             "density_per_sqm": 0.0,
+            "density_calibrated": bool(self.area_sqm),
             "turbulence": 0.0,
             "convergence": 0.0,
             "risk_density": 0.0,
@@ -1121,6 +1165,7 @@ class CameraPipeline:
             "risk_level_formula": "SAFE",
             "risk_level_density": "SAFE",
             "forecast_eta_s": None,
+            "forecast_estimate": None,
             "area_sqm": float(self.area_sqm) if self.area_sqm else None,
             "min_people": float(self.min_people),
             "timestamp": float(time.time() * 1000.0),
@@ -1360,6 +1405,18 @@ class SharedSystemState:
             risk_thresholds["critical"] = critical
             if not (moderate < high < critical):
                 risk_thresholds = dict(RISK_SCORE_THRESHOLDS)
+
+        # I-B9: ONE source of truth for HIGH. The UI slider (alert_threshold)
+        # is authoritative when supplied; otherwise risk_thresholds.high is.
+        # Mirroring prevents formula-HIGH and the alert gate from diverging.
+        if raw_threshold is not None:
+            alert_threshold = min(
+                max(alert_threshold, risk_thresholds["moderate"] + 1e-4),
+                risk_thresholds["critical"] - 1e-4,
+            )
+            risk_thresholds["high"] = float(alert_threshold)
+        else:
+            alert_threshold = float(risk_thresholds["high"])
 
         stride = self.stride
         raw_stride = payload.get("stride")
