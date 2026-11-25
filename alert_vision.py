@@ -595,12 +595,14 @@ class CameraPipeline:
         confidences = []
         occupied_area = 0.0
 
+        _conf = float(os.environ.get("ALERT_VISION_CONF") or PERSON_CONFIDENCE_THRESHOLD)
+        conf = float(min(0.95, max(0.05, _conf)))
         results = self.model.track(
             frame,
             persist=True,
-            tracker=os.environ.get("ALERT_VISION_CONF") or TRACKER_CONFIG,
+            tracker=os.environ.get("ALERT_VISION_TRACKER") or TRACKER_CONFIG,
             classes=[PERSON_CLASS_ID],
-            conf=PERSON_CONFIDENCE_THRESHOLD,
+            conf=conf,
             device=self.device,
             verbose=False,
         )
@@ -611,7 +613,7 @@ class CameraPipeline:
             track_ids = boxes.id.cpu().tolist() if boxes.id is not None else [None] * len(scores)
             for box, confidence, track_id in zip(coords, scores, track_ids):
                 confidence = float(confidence)
-                if confidence < PERSON_CONFIDENCE_THRESHOLD:
+                if confidence < conf:
                     continue
                 x1, y1, x2, y2 = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
                 box_w = max(0.0, x2 - x1)
@@ -686,45 +688,47 @@ class CameraPipeline:
                 self.current_risk = instant_level
                 self._risk_since = now_mono
                 self._deescalation_since = None
+                # F2/A6: on downgrade the alert state advances so a later rise fires again.
+                self.alert_state = self.current_risk
 
         alert_event = None
         alert_fired = False
-        if (
-            self.current_risk in ("HIGH", "CRITICAL")
-            and self.alert_state != self.current_risk
-            and time.monotonic() >= self.cooldown_until
-        ):
-            level_threshold = float(
-                self.state.config_snapshot()["risk_thresholds"].get(
-                    self.current_risk, RISK_SCORE_THRESHOLDS.get(self.current_risk, DEFAULT_ALERT_THRESHOLD)
-                )
-            )
-            density_forced = density_level is not None and density_level == self.current_risk
-            if density_forced or float(risk_score) >= level_threshold:
-                action = "DISPATCH" if self.current_risk == "CRITICAL" else "ESCALATE"
-                self.alert_id += 1
-                alert_event = {
-                    "alert_id": self.alert_id,
-                    "action": action,
-                    "risk_level": self.current_risk,
-                    "confidence": avg_confidence,
-                    "timestamp": time.time() * 1000.0,
-                }
-                self.cooldown_until = time.monotonic() + ALERT_COOLDOWN_SECONDS
-                with self.frame_lock:
-                    self.alert_queue.append(alert_event)
-                self.state.log_alert(
-                    self.id,
-                    self.current_risk,
-                    avg_confidence,
-                    risk_score=float(risk_score),
-                    people=int(people_now),
-                    alert_id=int(alert_event["alert_id"]),
-                    label=self.label,
-                )
-                self.state.record_alert(self.id, alert_event)
-                alert_fired = True
-        self.alert_state = self.current_risk
+        alert_level = str(self.current_risk or "SAFE")
+        if alert_level in ("HIGH", "CRITICAL"):
+            if alert_level != str(self.alert_state or "SAFE"):
+                # A new (higher) level than the last alerted level fires immediately.
+                # Repeats of the SAME level are governed by the cooldown only.
+                should_fire = True
+            else:
+                should_fire = time.monotonic() >= self.cooldown_until
+            if should_fire:
+                density_forced = density_level is not None and str(density_level) == alert_level
+                level_threshold = float(config.get("alert_threshold") or DEFAULT_ALERT_THRESHOLD)
+                if density_forced or float(risk_score) >= level_threshold:
+                    action = "DISPATCH" if self.current_risk == "CRITICAL" else "ESCALATE"
+                    self.alert_id += 1
+                    alert_event = {
+                        "alert_id": self.alert_id,
+                        "action": action,
+                        "risk_level": self.current_risk,
+                        "confidence": avg_confidence,
+                        "timestamp": time.time() * 1000.0,
+                    }
+                    self.alert_state = self.current_risk
+                    self.cooldown_until = time.monotonic() + ALERT_COOLDOWN_SECONDS
+                    with self.frame_lock:
+                        self.alert_queue.append(alert_event)
+                    self.state.log_alert(
+                        self.id,
+                        self.current_risk,
+                        avg_confidence,
+                        risk_score=float(risk_score),
+                        people=int(people_now),
+                        alert_id=int(alert_event["alert_id"]),
+                        label=self.label,
+                    )
+                    self.state.record_alert(self.id, alert_event)
+                    alert_fired = True
         self.risk_score = float(risk_score)
 
         with self.frame_lock:
@@ -745,7 +749,7 @@ class CameraPipeline:
             "id": self.id,
             "label": self.label,
             "source": _source_display(self.source),
-            "source_value": self.source,
+            "source_value_masked": _source_display(self.source),
             "online": True,
             "people_now": int(people_now),
             "unique_ids": int(len(self.seen_ids)),
@@ -828,7 +832,7 @@ class CameraPipeline:
             "id": self.id,
             "label": self.label,
             "source": _source_display(self.source),
-            "source_value": self.source,
+            "source_value_masked": _source_display(self.source),
             "online": False,
             "people_now": 0,
             "unique_ids": int(len(self.seen_ids)),
@@ -884,7 +888,7 @@ class CameraPipeline:
             packet["alert_id"] = 0
         packet["label"] = self.label
         packet["source"] = _source_display(self.source)
-        packet["source_value"] = self.source
+        packet["source_value_masked"] = _source_display(self.source)
         packet["online"] = bool(self.online)
         packet["camera_online"] = bool(self.online)
         packet["last_frame_age_ms"] = float(frame_age_ms)
@@ -1531,28 +1535,7 @@ class AlertVisionBackend:
                     f"| MJPEG relay on http://{HOST}:{VIDEO_PORT}/video?cam=<id>"
                 )
                 while True:
-                    packet = self.state.build_packet()
-                    alerted_ids = set()
-                    if packet.get("alert"):
-                        for cam in packet.get("cameras") or []:
-                            if isinstance(cam, dict) and bool(cam.get("alert")):
-                                alerted_ids.add(str(cam.get("id")))
-                                await self.broadcaster.broadcast(
-                                    {
-                                        "type": "alert",
-                                        "alert_id": int(cam.get("alert_id") or 0),
-                                        "camera_id": str(cam.get("id") or ""),
-                                        "camera_label": str(cam.get("label") or ""),
-                                        "risk_level": str(cam.get("risk_level") or "HIGH"),
-                                        "action": str(cam.get("action") or "ESCALATE"),
-                                        "confidence": float(cam.get("confidence") or 0.0),
-                                        "timestamp": float(cam.get("timestamp") or time.time() * 1000.0),
-                                    }
-                                )
-                    if alerted_ids and self.broadcaster.active_count() > 0:
-                        for cam_id, pipeline in list(self.state.cameras.items()):
-                            if str(cam_id) in alerted_ids:
-                                pipeline.acknowledge_alert()
+                    await self._broadcast_tick()
                     await asyncio.sleep(BROADCAST_INTERVAL)
         finally:
             self.state.shutdown()
@@ -1563,6 +1546,44 @@ class AlertVisionBackend:
             if relay_thread is not None:
                 relay_thread.join(timeout=5)
             print(":: [Alert Vision] Backend shutdown complete")
+
+    async def _broadcast_tick(self) -> dict:
+        """One telemetry tick: build the full packet, broadcast it, then flush alerts.
+
+        F1/A1: the full telemetry packet is broadcast to all connected clients every
+        ``BROADCAST_INTERVAL`` even when no alert fired, so the dashboard always shows
+        live state (risk, people, scores, source, etc.).
+        """
+        packet = self.state.build_packet()
+        alerted_ids = set()
+        if packet.get("alert"):
+            for cam in packet.get("cameras") or []:
+                if isinstance(cam, dict) and bool(cam.get("alert")):
+                    alerted_ids.add(str(cam.get("id")))
+
+        if self.broadcaster.active_count() > 0:
+            await self.broadcaster.broadcast(packet)
+
+        for cam in packet.get("cameras") or []:
+            if isinstance(cam, dict) and bool(cam.get("alert")):
+                await self.broadcaster.broadcast(
+                    {
+                        "type": "alert",
+                        "alert_id": int(cam.get("alert_id") or 0),
+                        "camera_id": str(cam.get("id") or ""),
+                        "camera_label": str(cam.get("label") or ""),
+                        "risk_level": str(cam.get("risk_level") or "HIGH"),
+                        "action": str(cam.get("action") or "ESCALATE"),
+                        "confidence": float(cam.get("confidence") or 0.0),
+                        "timestamp": float(cam.get("timestamp") or time.time() * 1000.0),
+                    }
+                )
+
+        if alerted_ids and self.broadcaster.active_count() > 0:
+            for cam_id, pipeline in list(self.state.cameras.items()):
+                if str(cam_id) in alerted_ids:
+                    pipeline.acknowledge_alert()
+        return packet
 
 
 def _initial_specs():

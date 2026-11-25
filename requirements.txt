@@ -1,6 +1,7 @@
-# Core runtime dependencies (pinned for reproducibility)
-# -------------------------------------------------------
-# websockets   - WebSocket server/client (port 8765)
-# opencv-python - OpenCV (lazy-imported in analytics.py only; no UI deps)
-# numpy        - numerical operations for density/risk calculations
-#             - All other logic is pure Python; no Streamlit/cv2-UI deps
+# Core runtime dependencies (pinned for reproducibility) - Alert Vision
+opencv-python==4.10.0.84
+numpy==1.26.4
+websockets==12.0
+ultralytics==8.0.88
+torch==2.2.2
+lapx==0.0.9

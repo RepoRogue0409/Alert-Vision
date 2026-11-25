@@ -1,10 +1,4 @@
-# Optional dependencies (LWCC, optional analytics extensions)
+# Optional dependencies (LWCC, optional analytics extensions) - Alert Vision
 # -------------------------------------------------------
-# lwcc          - Live Weather & Crowd Conditions (off by default)
-#             - Lazy-imported; only loaded when explicitly enabled
-# streamlit     - Interactive web UI alternative (not used in this build)
-# ultralytics   - YOLOv8 model exports; yolo v8n.pt is shipped separately
-# torch         - PyTorch runtime for model inference
-#             - Only loaded if model retraining is needed
-# altair        - Charting library for dashboard visualizations
-# pandas        - Dataframe support for ledger/history
+# lwcc - Lightweight Crowd Counting library (optional; off by default; lazy-imported)
+lwcc==0.0.1

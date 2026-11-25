@@ -51,6 +51,7 @@
     alarmTitle: document.getElementById("ui-alarm-title"),
     alarmMeta: document.getElementById("ui-alarm-meta"),
     alarmAck: document.getElementById("ui-alarm-ack"),
+    alarmMute: document.getElementById("ui-alarm-mute"),
     barDensity: document.getElementById("bar-density"),
     barDensityValue: document.getElementById("bar-density-val"),
     barRate: document.getElementById("bar-rate"),
@@ -770,6 +771,7 @@
     }
     if (packet.type === "alert") {
       appendLedgerFromEvent(packet);
+      showAlarm(packet);
       return;
     }
     if (packet.type === "config_ack") {
@@ -830,6 +832,7 @@
 
     packet.cameras.forEach(function (cam) {
       if (cam.alert === true) {
+        showAlarm(cam);
         appendLedgerFromEvent(cam);
       }
     });
@@ -837,11 +840,19 @@
 
   function adoptBackendCameras(cameras) {
     state.cameras = cameras.map(function (cam, index) {
-      var source = cam.source_value;
+      var source = cam.source_value_masked;
+      if (source === undefined || source === null) {
+        source = cam.source_value;
+      }
       if (source === undefined || source === null) {
         source = cam.source;
       }
-      var isIndex = typeof source === "number" || /^\d+$/.test(String(source || ""));
+      source = String(source === undefined || source === null ? "" : source).trim();
+      if (source.indexOf("***@") >= 0) {
+        /* masked RTSP source: drop the masked credentials, host stays readable */
+        source = source.split("***@").join("@");
+      }
+      var isIndex = typeof source === "number" || (/^\d+$/.test(source));
       var restored = makeCamera(cam.id || "cam" + (index + 1), {});
       if (isIndex) {
         restored.kind = "webcam";
@@ -849,10 +860,14 @@
         restored.index = Math.max(0, parseInt(source, 10) || 0);
       } else if (source) {
         restored.kind = "network";
-        if (!parseUrlInto(restored, String(source))) {
+        if (!parseUrlInto(restored, source)) {
           restored.preset = "custom";
           restored.host = "";
           restored.path = "/";
+        }
+        restored.password = "";
+        if (restored.kind === "network" && restored.host) {
+          restored.username = restored.username || "";
         }
       } else {
         restored.kind = "network";
@@ -981,6 +996,123 @@
 
     if (ui.focusLabel) {
       ui.focusLabel.textContent = "FOCUS: " + (cam.label || cam.id);
+    }
+
+    /* A2: auto-clear the alarm banner when this camera returns to SAFE/MODERATE for 10s */
+    var currentLevelNow = normalizeLevel(cam.risk_level);
+    if (alarmState.cameraId === cam.id && RISK_RANK[currentLevelNow] < ALARM_MIN_RANK) {
+      armAutoClear(cam.id, currentLevelNow);
+    }
+  }
+
+  /* -- A2: alarm banner + beep + tile flash + auto-clear -------------------- */
+  var alarmTimer = null;
+  var alarmMuted = false;
+
+  function alarmVisible() {
+    if (!ui.alarm) return false;
+    return ui.alarm.classList.contains("visible") || ui.alarm.style.display === "flex";
+  }
+
+  function armAutoClear(camId, level) {
+    if (alarmTimer) clearTimeout(alarmTimer);
+    alarmTimer = null;
+    if (RISK_RANK[level] < ALARM_MIN_RANK) {
+      alarmTimer = setTimeout(function () {
+        alarmTimer = null;
+        if (alarmVisible() && alarmState.cameraId === camId) {
+          hideAlarm();
+        }
+      }, 10000);
+    }
+  }
+
+  function flashTile(camId) {
+    var refs = viewRefs[camId];
+    if (!refs || !refs.tile) return;
+    refs.tile.classList.add("alarm");
+  }
+
+  function playAlarmBeep(muted) {
+    if (muted) return;
+    try {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (audioCtx.state === "suspended") {
+        audioCtx.resume();
+      }
+      var osc = audioCtx.createOscillator();
+      var gain = audioCtx.createGain();
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      var t0 = audioCtx.currentTime;
+      osc.frequency.value = 880;
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(0.2, t0 + 0.05);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.7);
+      osc.start(t0);
+      osc.stop(t0 + 0.7);
+    } catch (error) {
+      /* audio unavailable - never crash the dashboard */
+    }
+  }
+
+  function showAlarm(cam) {
+    var level = normalizeLevel(cam && cam.risk_level ? cam.risk_level : alarmState.level);
+    if (RISK_RANK[level] < ALARM_MIN_RANK) {
+      return;
+    }
+    alarmState = {
+      alertId: toInt(cam && cam.alert_id, 0),
+      cameraId: String((cam && (cam.camera_id || cam.id)) || ""),
+      level: level,
+      muted: alarmMuted
+    };
+    if (ui.alarm) {
+      ui.alarm.classList.add("visible");
+      ui.alarm.style.display = "flex";
+    }
+    if (ui.alarmTitle) {
+      ui.alarmTitle.textContent = "\u26a0 " + level + " CROWD ALERT";
+    }
+    var parts = [];
+    var label = cam.camera_label || cam.label || cam.camera_id || cam.id || "Camera";
+    parts.push(label);
+    if (cam.people_now !== undefined && cam.people_now !== null) {
+      parts.push(Math.round(toNumber(cam.people_now, 0)) + " people");
+    }
+    if (cam.risk_score !== undefined && cam.risk_score !== null) {
+      parts.push("score " + toNumber(cam.risk_score, 0).toFixed(2));
+    }
+    var stamp = toNumber(cam.timestamp, Date.now());
+    parts.push(new Date(stamp).toLocaleTimeString());
+    if (ui.alarmMeta) {
+      ui.alarmMeta.textContent = parts.join(" \u00b7 ");
+    }
+    flashTile(alarmState.cameraId);
+    var refs = viewRefs[alarmState.cameraId];
+    if (refs) {
+      updateTile(cam);
+    }
+    playAlarmBeep(alarmMuted);
+    armAutoClear(alarmState.cameraId, level);
+  }
+
+  function hideAlarm() {
+    if (alarmTimer) {
+      clearTimeout(alarmTimer);
+      alarmTimer = null;
+    }
+    var previousCameraId = alarmState.cameraId;
+    alarmState = { alertId: 0, cameraId: "", level: "SAFE", muted: alarmMuted };
+    if (ui.alarm) {
+      ui.alarm.classList.remove("visible");
+      ui.alarm.style.display = "none";
+    }
+    var refs = viewRefs[previousCameraId];
+    if (refs && refs.tile) {
+      refs.tile.classList.remove("alarm");
     }
   }
 
@@ -1622,15 +1754,20 @@
   }
 
   function bindAlarmAck() {
-    if (!ui.alarmAck) return;
-    ui.alarmAck.addEventListener("click", function () {
-      alarmState = { alertId: 0, cameraId: "", level: "SAFE" };
-      setNoSignal(null, false, "");
-      ui.alarm.classList.remove("alarm");
-      ui.alarmTitle.textContent = "⚠ CROWD ALERT";
-      ui.alarmMeta.textContent = "No active alerts";
-      ui.alarm.style.display = "none";
-    });
+    if (ui.alarmAck) {
+      ui.alarmAck.addEventListener("click", function () {
+        hideAlarm();
+      });
+    }
+    if (ui.alarmMute) {
+      ui.alarmMute.addEventListener("click", function () {
+        alarmMuted = !alarmMuted;
+        alarmState = alarmState || { alertId: 0, cameraId: "", level: "SAFE", muted: alarmMuted };
+        if (!alarmMuted) {
+          playAlarmBeep(false);
+        }
+      });
+    }
   }
 
   /* ------------------------------------------------------------------ */
