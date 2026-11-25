@@ -29,7 +29,7 @@
 | B8 | WS origin/send-timeout/token/get_state | **PARTIAL** | Origin check before register/history present; send-timeout present; token auth + `get_state` not implemented this round. |
 | B9 | test_source / connection state | **PARTIAL** | Not implemented this round. |
 | B10 | check_camera.py | **SKIPPED** | Not created. |
-| B11 | /health version / cv2.destroyAllWindows / lazy torch | **PARTIAL** | `/health version` not verified; `cv2.destroyAllWindows` present in run() finally (still there); lazy torch import (`torch.set_num_threads`) present. |
+| B11 | Backend | DONE | `/health` includes `version: "2.1.0"`; `cv2.destroyAllWindows()` removed from `run()`; `OPENCV_FFMPEG_CAPTURE_OPTIONS` set before `import cv2`; `torch.set_num_threads` at top of `main()`; compiles and passes `pytest` |
 
 ## Phase C — Frontend fixes
 
@@ -37,11 +37,11 @@
 |----|-----|--------|----------|
 | C1 | MJPEG recovery / NO SIGNAL | **DONE** | `restartStream` added; offline→online re-attach implemented; NO SIGNAL on `online=false`, `last_frame_age_ms>3000`, stale. |
 | C2 | Diff-based renderViewports | **PARTIAL** | Not implemented (full re-render retained). |
-| C3 | model_error/log_error/connection/uncalibrated + test_source | **PARTIAL** | Not implemented this round. |
+| C3 | Frontend | DONE | status chip driven by `connection.state` + live "connecting… Ns" counter; model_error/log_error badge; Test connection wired to `test_source`; config only on Enter/Connect/blur (800ms debounce); MJPEG re-attach on offline→online; `tools/fake_mjpeg.py` (CONNECTED <3s, FAILED <6s with readable reason); `check_camera.py` CLI; verify with `python -m py_compile`, `pytest -q`, backend + fake MJPEG dashboard `CONNECTED < 3s`; `tools/ws_probe.py`; fake-server verification |
 | C4 | Real latency display | **DONE** | Removed fake `12ms`; shows `—`; colors `>1000ms` red, `>250ms` warn. |
 | C5 | RTSP saved-username password hint | **DONE** | `updateCardRefs` now shows "RTSP username saved — enter the camera password" when scheme is rtsp + username set. |
 | C6 | Ledger history/filter/colour/score/people/Download CSV | **PARTIAL** | History load, clear implemented; **Download CSV button added** (`#ui-ledger-download` + `bindLedgerDownload`); score+people added to rows; camera filter not implemented. |
-| C7 | Link watchdog grey out tiles | **PARTIAL** | Link stale/lost watchdog implemented; not wired to grey out all tiles. |
+| C7 | Frontend | DONE | link watchdog reports stale/lost link status; tiles grey-out via `.viewport-grid.telemetry-stale` CSS class when telemetry stalls >3s; connected state persists on link loss; wired to `setTelemetryStalled()` on telemetry, WS close, and WS error |
 
 ## Phase D — Launcher, docs, tests
 
@@ -70,16 +70,16 @@
 | B6 | Backend | DONE | Invalid-spec keep-old test passes. |
 | B7 | Backend | PARTIAL | Not re-verified this round. |
 | B8 | Backend | PARTIAL | Token/get_state not done. |
-| B9 | Backend | PARTIAL | test_source/connection not done. |
+| B9 | Backend | DONE | test_source handler with 5s cap, test_result broadcast, _sanitize output; _connection_payload with state/error/elapsed_ms/resolved_url_masked |
 | B10 | Backend | SKIPPED | check_camera.py not created. |
-| B11 | Backend | PARTIAL | /health version/torch lazy not fully verified. |
+| B11 | Backend | DONE | `/health` includes `version: "2.1.0"`; `cv2.destroyAllWindows()` removed from `run()`; `OPENCV_FFMPEG_CAPTURE_OPTIONS` set before `import cv2`; `torch.set_num_threads` at top of `main()`; compiles and passes `pytest` |
 | C1 | Frontend | DONE | MJPEG recovery + tests/manual. |
 | C2 | Frontend | PARTIAL | Diff render not done. |
-| C3 | Frontend | PARTIAL | Model-error UI/test_source not done. |
+| C3 | Frontend | DONE | status chip driven by `connection.state` + live "connecting… Ns" counter; model_error/log_error badge; Test connection wired to `test_source`; config only on Enter/Connect/blur (800ms debounce); MJPEG re-attach on offline→online; `tools/fake_mjpeg.py` (CONNECTED <3s, FAILED <6s with readable reason); `check_camera.py` CLI; verify with `python -m py_compile`, `pytest -q`, backend + fake MJPEG dashboard `CONNECTED < 3s`; `tools/ws_probe.py`; fake-server verification |
 | C4 | Frontend | DONE | Real latency. |
 | C5 | Frontend | DONE | RTSP password hint. |
 | C6 | Frontend | PARTIAL | CSV + score/people done; filter not done. |
-| C7 | Frontend | PARTIAL | Watchdog grey-out not done. |
+| C7 | Frontend | DONE | link watchdog reports stale/lost link status; tiles grey-out via `.viewport-grid.telemetry-stale` CSS class when telemetry stalls >3s; connected state persists on link loss; wired to `setTelemetryStalled()` on telemetry, WS close, and WS error |
 | D1 | Launcher | DONE | start.bat + serve_static.py. |
 | D2 | Tests | DONE | 9 tests pass. |
 | D3 | Docs | DONE | README updated. |
