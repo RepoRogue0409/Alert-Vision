@@ -11,7 +11,7 @@ No accuracy or capacity claim is made without a measurement recorded in
 | `python -m py_compile alert_vision.py analytics.py check_camera.py serve_static.py` | **PASS** (no output, exit 0) |
 | `python -m py_compile tools/benchmark_multicam.py tools/benchmark_inference.py` | **PASS** |
 | `python -m pytest -q` | **64 passed, 0 failed** (last run: 20.46 s) |
-| `python tools/verify_connect.py` (synthetic camera) | **CONNECTED 2140 ms (<3000 PASS)**, **FAILED 4703 ms (<6000 PASS, reason: timeout: host did not respond)** |
+| `python tools/verify_connect.py` (synthetic camera) | **CONNECTED 2641 ms (<3000 PASS)**, **FAILED 4641 ms (<6000 PASS, reason: timeout: host did not respond)** |
 | `pip install --dry-run -r requirements-dev.txt` in a clean venv | **PASS** — resolves `pytest-9.2.0` (range `>=8.3.3,<10`) |
 | Generated browser-helper PowerShell parse check | **PASS** (`Parser::ParseFile`, 0 errors) |
 | `python tools/benchmark_multicam.py --counts 1 2 4 6 --seconds 6` | **4/4 runs ok**, cameras_online matched requested count |
