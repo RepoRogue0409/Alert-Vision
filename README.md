@@ -3,7 +3,8 @@
 **Alert Vision** is a multi-camera crowd-safety telemetry engine for Windows + Python 3.11.
 It combines a threaded camera shell, WebSocket dashboard, and MJPEG stream with tested
 CrowdShield analytics for risk scoring, forecasting, and alerting.
-
+And also this is advance version of CowrdShiled
+Git Hub repo link: https://github.com/shivamvida/cowrd-shiled
 ## Quick start
 
 1. **Install deps**
